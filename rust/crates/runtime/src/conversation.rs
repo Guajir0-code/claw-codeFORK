@@ -511,7 +511,7 @@ where
         let mut mutation_sequence = 0_u64;
         let mut verification_ledger =
             BTreeMap::<VerificationLedgerKey, VerificationLedgerEntry>::new();
-        let mut final_gate_attempts = BTreeMap::<VerificationLedgerKey, u32>::new();
+        let mut final_gate_attempts = BTreeMap::<(VerificationLedgerKey, u64), u32>::new();
 
         loop {
             iterations += 1;
@@ -603,12 +603,14 @@ where
                 verification_gate.passed = false;
 
                 for (key, should_run) in pending_final_gate_keys {
-                    let attempts = final_gate_attempts.entry(key.clone()).or_insert(0);
-                    *attempts += 1;
-                    let attempts_now = *attempts;
                     let Some(entry) = verification_ledger.get(&key).cloned() else {
                         continue;
                     };
+                    let attempts = final_gate_attempts
+                        .entry((key.clone(), entry.last_mutation_sequence))
+                        .or_insert(0);
+                    *attempts += 1;
+                    let attempts_now = *attempts;
                     if attempts_now > MAX_FINAL_GATE_ATTEMPTS {
                         let report = Self::make_final_gate_unavailable_report(
                             &entry,
