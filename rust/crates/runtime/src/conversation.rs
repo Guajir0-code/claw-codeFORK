@@ -16,9 +16,11 @@ use crate::permissions::{
 use crate::session::{ContentBlock, ConversationMessage, Session};
 use crate::usage::{TokenUsage, UsageTracker};
 use crate::verifier::{
-    prepend_verifier_summary, VerificationContext, VerificationGateStatus, VerificationPhase,
-    VerificationReport, VerificationStatus, Verifier,
+    prepend_verifier_summary, VerificationContext, VerificationFailureKind, VerificationGateStatus,
+    VerificationPhase, VerificationReport, VerificationStatus, VerificationStepReport, Verifier,
 };
+
+const MAX_FINAL_GATE_ATTEMPTS: u32 = 5;
 
 const DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD: u32 = 100_000;
 const AUTO_COMPACTION_THRESHOLD_ENV_VAR: &str = "CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS";
@@ -402,22 +404,27 @@ where
         })
     }
 
+    fn sanitize_root_fragment(root: &std::path::Path) -> String {
+        root.display()
+            .to_string()
+            .chars()
+            .map(|ch| match ch {
+                '\\' | '/' | ':' | ' ' => '-',
+                other => other,
+            })
+            .collect::<String>()
+    }
+
     fn make_final_gate_reminder(entry: &VerificationLedgerEntry) -> VerificationReport {
         let status = entry
             .last_final_status
             .unwrap_or(VerificationStatus::Failed);
         VerificationReport {
             report_id: format!(
-                "vr-reminder-{}",
-                entry.project_root
-                    .display()
-                    .to_string()
-                    .chars()
-                    .map(|ch| match ch {
-                        '\\' | '/' | ':' | ' ' => '-',
-                        other => other,
-                    })
-                    .collect::<String>()
+                "vr-reminder-{}-{}-{}",
+                entry.adapter_id,
+                Self::sanitize_root_fragment(&entry.project_root),
+                entry.last_mutation_sequence
             ),
             phase: VerificationPhase::Final,
             adapter_id: entry.adapter_id.clone(),
@@ -431,6 +438,43 @@ where
                 entry.project_root.display()
             ),
             steps: Vec::new(),
+        }
+    }
+
+    fn make_final_gate_unavailable_report(
+        entry: &VerificationLedgerEntry,
+        reason: &str,
+    ) -> VerificationReport {
+        let summary_text = format!(
+            "[verifier:final:{}] unavailable ({})\n[verifier] {}",
+            entry.adapter_id,
+            entry.project_root.display(),
+            reason
+        );
+        VerificationReport {
+            report_id: format!(
+                "vr-unavailable-{}-{}-{}",
+                entry.adapter_id,
+                Self::sanitize_root_fragment(&entry.project_root),
+                entry.last_mutation_sequence
+            ),
+            phase: VerificationPhase::Final,
+            adapter_id: entry.adapter_id.clone(),
+            project_root: entry.project_root.clone(),
+            touched_paths: entry.touched_paths.iter().cloned().collect(),
+            status: VerificationStatus::Unavailable,
+            summary_text,
+            steps: vec![VerificationStepReport {
+                adapter: entry.adapter_id.clone(),
+                project_root: entry.project_root.clone(),
+                label: "final-gate setup".to_string(),
+                command: String::new(),
+                phase: VerificationPhase::Final,
+                status: VerificationStatus::Unavailable,
+                failure_kind: Some(VerificationFailureKind::ToolUnavailable),
+                duration_ms: 0,
+                truncated_output: reason.to_string(),
+            }],
         }
     }
 
@@ -467,6 +511,7 @@ where
         let mut mutation_sequence = 0_u64;
         let mut verification_ledger =
             BTreeMap::<VerificationLedgerKey, VerificationLedgerEntry>::new();
+        let mut final_gate_attempts = BTreeMap::<VerificationLedgerKey, u32>::new();
 
         loop {
             iterations += 1;
@@ -558,13 +603,42 @@ where
                 verification_gate.passed = false;
 
                 for (key, should_run) in pending_final_gate_keys {
+                    let attempts = final_gate_attempts.entry(key.clone()).or_insert(0);
+                    *attempts += 1;
+                    let attempts_now = *attempts;
                     let Some(entry) = verification_ledger.get(&key).cloned() else {
                         continue;
                     };
+                    if attempts_now > MAX_FINAL_GATE_ATTEMPTS {
+                        let report = Self::make_final_gate_unavailable_report(
+                            &entry,
+                            &format!(
+                                "final gate aborted after {MAX_FINAL_GATE_ATTEMPTS} attempts without convergence"
+                            ),
+                        );
+                        if let Some(ledger_entry) = verification_ledger.get_mut(&key) {
+                            ledger_entry.last_final_status = Some(report.status);
+                            ledger_entry.last_final_verified_sequence =
+                                Some(ledger_entry.last_mutation_sequence);
+                        }
+                        self.record_verifier_ran(
+                            iterations,
+                            &format!("final_gate:{}", entry.adapter_id),
+                            false,
+                        );
+                        verification_gate.report_ids.push(report.report_id.clone());
+                        self.persist_verification_report(&report)?;
+                        gate_reports.push(report);
+                        continue;
+                    }
                     let report = if should_run {
-                        let Some(report) = self.run_final_verification(&entry) else {
-                            continue;
-                        };
+                        let report =
+                            self.run_final_verification(&entry).unwrap_or_else(|| {
+                                Self::make_final_gate_unavailable_report(
+                                    &entry,
+                                    "final verification is unavailable (no verifier configured for this target)",
+                                )
+                            });
                         if let Some(ledger_entry) = verification_ledger.get_mut(&key) {
                             ledger_entry.last_final_status = Some(report.status);
                             ledger_entry.last_final_verified_sequence =

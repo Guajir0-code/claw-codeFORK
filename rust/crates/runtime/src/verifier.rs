@@ -202,16 +202,6 @@ impl VerificationReport {
             first.to_string()
         }
     }
-
-    #[must_use]
-    pub fn target(&self, mutation_sequence: u64) -> VerificationTarget {
-        VerificationTarget {
-            adapter_id: self.adapter_id.clone(),
-            project_root: self.project_root.clone(),
-            touched_paths: self.touched_paths.clone(),
-            mutation_sequence,
-        }
-    }
 }
 
 /// Status of the staged final gate for the completed turn.
@@ -355,8 +345,8 @@ impl Adapter {
     ) -> Option<VerificationReport> {
         match self {
             Self::Rust => verify_rust(path, context, config),
-            Self::NodeTypeScript => verify_node(path, context, config, false),
-            Self::Python => verify_python(path, context, config, false),
+            Self::NodeTypeScript => verify_node(path, context, config),
+            Self::Python => verify_python(path, context, config),
         }
     }
 
@@ -618,20 +608,25 @@ fn verify_node(
     path: &Path,
     context: &VerificationContext,
     config: &CargoVerifierConfig,
-    final_phase: bool,
 ) -> Option<VerificationReport> {
     if !config.node_enabled {
         return None;
     }
     let package_json = nearest_file(path, "package.json")?;
     let project_root = package_json.parent()?.to_path_buf();
-    let package_contents = fs::read_to_string(&package_json).ok()?;
-    let package_value: Value = serde_json::from_str(&package_contents).ok()?;
-    let phase = if final_phase {
-        VerificationPhase::Final
-    } else {
-        context.phase
+    let package_value = match load_node_package(&package_json) {
+        Ok(value) => value,
+        Err(report) => {
+            return Some(node_setup_failure_report(
+                &project_root,
+                context.touched_paths.clone(),
+                context.phase,
+                &report,
+                config.max_output_bytes,
+            ));
+        }
     };
+    let phase = context.phase;
     let package_manager = detect_package_manager(&project_root);
     let steps = if config.legacy_mode {
         node_legacy_steps(&project_root, &package_value, package_manager)
@@ -663,8 +658,18 @@ fn finalize_node(
         return None;
     }
     let package_json = target.project_root.join("package.json");
-    let package_contents = fs::read_to_string(&package_json).ok()?;
-    let package_value: Value = serde_json::from_str(&package_contents).ok()?;
+    let package_value = match load_node_package(&package_json) {
+        Ok(value) => value,
+        Err(report) => {
+            return Some(node_setup_failure_report(
+                &target.project_root,
+                target.touched_paths.clone(),
+                VerificationPhase::Final,
+                &report,
+                config.max_output_bytes,
+            ));
+        }
+    };
     let package_manager = detect_package_manager(&target.project_root);
     Some(run_planned_steps(
         "node-typescript",
@@ -675,6 +680,62 @@ fn finalize_node(
         config.node_timeout,
         config.max_output_bytes,
     ))
+}
+
+struct NodeSetupFailure {
+    label: String,
+    kind: VerificationFailureKind,
+    message: String,
+}
+
+fn load_node_package(package_json: &Path) -> Result<Value, NodeSetupFailure> {
+    let contents = fs::read_to_string(package_json).map_err(|error| NodeSetupFailure {
+        label: "package.json read".to_string(),
+        kind: VerificationFailureKind::Environment,
+        message: format!("failed to read {}: {error}", package_json.display()),
+    })?;
+    serde_json::from_str::<Value>(&contents).map_err(|error| NodeSetupFailure {
+        label: "package.json parse".to_string(),
+        kind: VerificationFailureKind::Config,
+        message: format!("failed to parse {}: {error}", package_json.display()),
+    })
+}
+
+fn node_setup_failure_report(
+    project_root: &Path,
+    touched_paths: Vec<PathBuf>,
+    phase: VerificationPhase,
+    failure: &NodeSetupFailure,
+    max_output_bytes: usize,
+) -> VerificationReport {
+    let steps = vec![VerificationStepReport {
+        adapter: "node-typescript".to_string(),
+        project_root: project_root.to_path_buf(),
+        label: failure.label.clone(),
+        command: project_root.join("package.json").display().to_string(),
+        phase,
+        status: VerificationStatus::Unavailable,
+        failure_kind: Some(failure.kind),
+        duration_ms: 0,
+        truncated_output: truncate_output(&failure.message, max_output_bytes),
+    }];
+    let summary_text = render_report_summary(
+        "node-typescript",
+        project_root,
+        phase,
+        VerificationStatus::Unavailable,
+        &steps,
+    );
+    VerificationReport {
+        report_id: next_report_id(),
+        phase,
+        adapter_id: "node-typescript".to_string(),
+        project_root: project_root.to_path_buf(),
+        touched_paths,
+        status: VerificationStatus::Unavailable,
+        summary_text,
+        steps,
+    }
 }
 
 fn node_quick_steps(
@@ -745,14 +806,8 @@ fn verify_python(
     path: &Path,
     context: &VerificationContext,
     config: &CargoVerifierConfig,
-    final_phase: bool,
 ) -> Option<VerificationReport> {
-    let phase = if final_phase {
-        VerificationPhase::Final
-    } else {
-        context.phase
-    };
-    verify_python_for_phase(path, &context.touched_paths, phase, config)
+    verify_python_for_phase(path, &context.touched_paths, context.phase, config)
 }
 
 fn finalize_python(
@@ -1668,7 +1723,15 @@ fn run_step(
     command.stdin(std::process::Stdio::null());
     command.stdout(std::process::Stdio::piped());
     command.stderr(std::process::Stdio::piped());
-    command.env("CARGO_TERM_COLOR", "never");
+    if step.command.first().is_some_and(|bin| {
+        let name = std::path::Path::new(bin)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or(bin);
+        name == "cargo"
+    }) {
+        command.env("CARGO_TERM_COLOR", "never");
+    }
     for arg in step.command.iter().skip(1) {
         command.arg(arg);
     }
