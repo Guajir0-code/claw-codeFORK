@@ -3188,6 +3188,7 @@ struct BuiltRuntime {
     plugins_active: bool,
     mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
     mcp_active: bool,
+    buffer_output: bool,
 }
 
 impl BuiltRuntime {
@@ -3195,6 +3196,7 @@ impl BuiltRuntime {
         runtime: ConversationRuntime<AnthropicRuntimeClient, CliToolExecutor>,
         plugin_registry: PluginRegistry,
         mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
+        buffer_output: bool,
     ) -> Self {
         Self {
             runtime: Some(runtime),
@@ -3202,6 +3204,7 @@ impl BuiltRuntime {
             plugins_active: true,
             mcp_state,
             mcp_active: true,
+            buffer_output,
         }
     }
 
@@ -3776,6 +3779,7 @@ impl LiveCli {
         hook_abort_monitor.stop();
         match result {
             Ok(summary) => {
+                let should_print_buffered = runtime.buffer_output;
                 self.replace_runtime(runtime)?;
                 spinner.finish(
                     "✨ Done",
@@ -3783,6 +3787,9 @@ impl LiveCli {
                     &mut stdout,
                 )?;
                 println!();
+                if should_print_buffered {
+                    print_buffered_turn_summary(&summary)?;
+                }
                 if let Some(event) = summary.auto_compaction {
                     println!(
                         "{}",
@@ -3850,6 +3857,12 @@ impl LiveCli {
                 })),
                 "tool_uses": collect_tool_uses(&summary),
                 "tool_results": collect_tool_results(&summary),
+                "verification_reports": collect_verification_reports(&summary),
+                "verification_gate": {
+                    "attempted": summary.verification_gate.attempted,
+                    "passed": summary.verification_gate.passed,
+                    "report_ids": summary.verification_gate.report_ids.clone(),
+                },
                 "prompt_cache_events": collect_prompt_cache_events(&summary),
                 "usage": {
                     "input_tokens": summary.usage.input_tokens,
@@ -5923,6 +5936,7 @@ fn render_export_text(session: &Session) -> String {
             MessageRole::User => "user",
             MessageRole::Assistant => "assistant",
             MessageRole::Tool => "tool",
+            MessageRole::Verification => "verification",
         };
         lines.push(format!("## {}. {role}", index + 1));
         for block in &message.blocks {
@@ -5941,6 +5955,16 @@ fn render_export_text(session: &Session) -> String {
                         "[tool_result id={tool_use_id} name={tool_name} error={is_error}] {output}"
                     ));
                 }
+                ContentBlock::VerificationReport {
+                    report_id,
+                    phase,
+                    status,
+                    summary_text,
+                } => lines.push(format!(
+                    "[verification_report id={report_id} phase={} status={}] {summary_text}",
+                    phase.as_str(),
+                    status.as_str()
+                )),
             }
         }
         lines.push(String::new());
@@ -6068,6 +6092,7 @@ fn run_export(
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 fn render_session_markdown(session: &Session, session_id: &str, session_path: &Path) -> String {
     let mut lines = vec![
         "# Conversation Export".to_string(),
@@ -6102,6 +6127,7 @@ fn render_session_markdown(session: &Session, session_id: &str, session_path: &P
             MessageRole::User => "User",
             MessageRole::Assistant => "Assistant",
             MessageRole::Tool => "Tool",
+            MessageRole::Verification => "Verification",
         };
         lines.push(format!("## {}. {role}", index + 1));
         lines.push(String::new());
@@ -6137,6 +6163,23 @@ fn render_session_markdown(session: &Session, session_id: &str, session_path: &P
                         short_tool_id(tool_use_id)
                     ));
                     let summary = summarize_tool_payload_for_markdown(output);
+                    if !summary.is_empty() {
+                        lines.push(format!("> {summary}"));
+                    }
+                    lines.push(String::new());
+                }
+                ContentBlock::VerificationReport {
+                    report_id,
+                    phase,
+                    status,
+                    summary_text,
+                } => {
+                    lines.push(format!(
+                        "**Verification** `{}` _(id `{report_id}`, status `{}`)_",
+                        phase.as_str(),
+                        status.as_str()
+                    ));
+                    let summary = summarize_tool_payload_for_markdown(summary_text);
                     if !summary.is_empty() {
                         lines.push(format!("> {summary}"));
                     }
@@ -6631,6 +6674,13 @@ fn build_runtime_with_plugin_state(
         plugin_registry,
         mcp_state,
     } = runtime_plugin_state;
+    let verifier_config = feature_config.verifier().clone();
+    let buffer_output = emit_output
+        && verifier_config.enabled()
+        && verifier_config.staged()
+        && verifier_config.final_gate();
+    let assistant_emit_output = emit_output && !buffer_output;
+    let tool_emit_output = emit_output && !buffer_output;
     plugin_registry.initialize()?;
     let policy = permission_policy(permission_mode, &feature_config, &tool_registry)
         .map_err(std::io::Error::other)?;
@@ -6640,14 +6690,14 @@ fn build_runtime_with_plugin_state(
             session_id,
             model,
             enable_tools,
-            emit_output,
+            assistant_emit_output,
             allowed_tools.clone(),
             tool_registry.clone(),
             progress_reporter,
         )?,
         CliToolExecutor::new(
             allowed_tools.clone(),
-            emit_output,
+            tool_emit_output,
             tool_registry.clone(),
             mcp_state.clone(),
         ),
@@ -6658,18 +6708,30 @@ fn build_runtime_with_plugin_state(
     if emit_output {
         runtime = runtime.with_hook_progress_reporter(Box::new(CliHookProgressReporter));
     }
-    let verifier_config = feature_config.verifier();
     if verifier_config.enabled() {
         let cargo_config = runtime::CargoVerifierConfig {
-            run_check: verifier_config.run_check(),
-            run_clippy: verifier_config.run_clippy(),
-            run_fmt: verifier_config.run_fmt(),
-            run_test: verifier_config.run_test(),
-            timeout: std::time::Duration::from_secs(verifier_config.timeout_secs()),
+            legacy_mode: !verifier_config.staged(),
+            quick_on_write: verifier_config.quick_on_write(),
+            final_gate: verifier_config.final_gate(),
+            max_output_bytes: verifier_config.max_output_bytes(),
+            rust_check: verifier_config.run_check(),
+            rust_clippy: verifier_config.run_clippy(),
+            rust_fmt: verifier_config.run_fmt(),
+            rust_test: verifier_config.run_test(),
+            rust_timeout: std::time::Duration::from_secs(verifier_config.timeout_secs()),
+            node_enabled: verifier_config.node_enabled(),
+            node_timeout: std::time::Duration::from_secs(verifier_config.node_timeout_secs()),
+            python_enabled: verifier_config.python_enabled(),
+            python_timeout: std::time::Duration::from_secs(verifier_config.python_timeout_secs()),
         };
         runtime = runtime.with_verifier(Box::new(runtime::CargoVerifier::new(cargo_config)));
     }
-    Ok(BuiltRuntime::new(runtime, plugin_registry, mcp_state))
+    Ok(BuiltRuntime::new(
+        runtime,
+        plugin_registry,
+        mcp_state,
+        buffer_output,
+    ))
 }
 
 struct CliHookProgressReporter;
@@ -7079,7 +7141,9 @@ impl AnthropicRuntimeClient {
 fn request_ends_with_tool_result(request: &ApiRequest) -> bool {
     request
         .messages
-        .last()
+        .iter()
+        .rev()
+        .find(|message| message.role != MessageRole::Verification)
         .is_some_and(|message| message.role == MessageRole::Tool)
 }
 
@@ -7192,6 +7256,51 @@ fn final_assistant_text(summary: &runtime::TurnSummary) -> String {
         .unwrap_or_default()
 }
 
+fn print_buffered_turn_summary(
+    summary: &runtime::TurnSummary,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let renderer = TerminalRenderer::new();
+    let mut stdout = io::stdout();
+
+    for message in &summary.tool_results {
+        for block in &message.blocks {
+            if let ContentBlock::ToolResult {
+                tool_name,
+                output,
+                is_error,
+                ..
+            } = block
+            {
+                writeln!(
+                    stdout,
+                    "\n{}",
+                    format_tool_result(tool_name, output, *is_error)
+                )?;
+            }
+        }
+    }
+
+    for report in &summary.verification_reports {
+        writeln!(
+            stdout,
+            "\n[verification {}:{}] {}",
+            report.phase.as_str(),
+            report.adapter_id,
+            report.status.as_str()
+        )?;
+        writeln!(stdout, "{}", report.summary_text)?;
+    }
+
+    let final_text = final_assistant_text(summary);
+    if !final_text.trim().is_empty() {
+        writeln!(stdout)?;
+        renderer.stream_markdown(&final_text, &mut stdout)?;
+        writeln!(stdout)?;
+    }
+
+    Ok(())
+}
+
 fn collect_tool_uses(summary: &runtime::TurnSummary) -> Vec<serde_json::Value> {
     summary
         .assistant_messages
@@ -7226,6 +7335,39 @@ fn collect_tool_results(summary: &runtime::TurnSummary) -> Vec<serde_json::Value
                 "is_error": is_error,
             })),
             _ => None,
+        })
+        .collect()
+}
+
+fn collect_verification_reports(summary: &runtime::TurnSummary) -> Vec<serde_json::Value> {
+    summary
+        .verification_reports
+        .iter()
+        .map(|report| {
+            json!({
+                "report_id": report.report_id.clone(),
+                "phase": report.phase.as_str(),
+                "adapter_id": report.adapter_id.clone(),
+                "project_root": report.project_root.display().to_string(),
+                "touched_paths": report
+                    .touched_paths
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>(),
+                "status": report.status.as_str(),
+                "summary_text": report.summary_text.clone(),
+                "steps": report.steps.iter().map(|step| json!({
+                    "adapter": step.adapter.clone(),
+                    "project_root": step.project_root.display().to_string(),
+                    "label": step.label.clone(),
+                    "command": step.command.clone(),
+                    "phase": step.phase.as_str(),
+                    "status": step.status.as_str(),
+                    "failure_kind": step.failure_kind.map(runtime::VerificationFailureKind::as_str),
+                    "duration_ms": step.duration_ms,
+                    "truncated_output": step.truncated_output.clone(),
+                })).collect::<Vec<_>>(),
+            })
         })
         .collect()
 }
@@ -8140,7 +8282,10 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
         .iter()
         .filter_map(|message| {
             let role = match message.role {
-                MessageRole::System | MessageRole::User | MessageRole::Tool => "user",
+                MessageRole::System
+                | MessageRole::User
+                | MessageRole::Tool
+                | MessageRole::Verification => "user",
                 MessageRole::Assistant => "assistant",
             };
             let content = message
@@ -8166,6 +8311,11 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
                         }],
                         is_error: *is_error,
                     },
+                    ContentBlock::VerificationReport { summary_text, .. } => {
+                        InputContentBlock::Text {
+                            text: summary_text.clone(),
+                        }
+                    }
                 })
                 .collect::<Vec<_>>();
             (!content.is_empty()).then(|| InputMessage {
@@ -8387,6 +8537,8 @@ mod tests {
     use std::fs;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -8628,45 +8780,89 @@ mod tests {
         .expect("skill file should write");
     }
 
+    fn make_executable(path: &Path) {
+        #[cfg(unix)]
+        {
+            let mut permissions = fs::metadata(path)
+                .expect("script metadata should load")
+                .permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(path, permissions).expect("script permissions should update");
+        }
+    }
+
+    fn script_name(stem: &str) -> String {
+        if cfg!(windows) {
+            format!("{stem}.cmd")
+        } else {
+            format!("{stem}.sh")
+        }
+    }
+
+    fn write_script(path: &Path, unix_body: &str, windows_body: &str) {
+        let body = if cfg!(windows) {
+            windows_body
+        } else {
+            unix_body
+        };
+        fs::write(path, body).expect("script should write");
+        make_executable(path);
+    }
+
+    fn python_command() -> &'static str {
+        if cfg!(windows) {
+            "python"
+        } else {
+            "python3"
+        }
+    }
+
     fn write_plugin_fixture(root: &Path, name: &str, include_hooks: bool, include_lifecycle: bool) {
         fs::create_dir_all(root.join(".claude-plugin")).expect("manifest dir");
+        let pre_hook_name = script_name("pre");
+        let init_name = script_name("init");
+        let shutdown_name = script_name("shutdown");
         if include_hooks {
             fs::create_dir_all(root.join("hooks")).expect("hooks dir");
-            fs::write(
-                root.join("hooks").join("pre.sh"),
+            write_script(
+                &root.join("hooks").join(&pre_hook_name),
                 "#!/bin/sh\nprintf 'plugin pre hook'\n",
-            )
-            .expect("write hook");
+                "@echo off\r\necho plugin pre hook\r\n",
+            );
         }
         if include_lifecycle {
             fs::create_dir_all(root.join("lifecycle")).expect("lifecycle dir");
-            fs::write(
-                root.join("lifecycle").join("init.sh"),
+            write_script(
+                &root.join("lifecycle").join(&init_name),
                 "#!/bin/sh\nprintf 'init\\n' >> lifecycle.log\n",
-            )
-            .expect("write init lifecycle");
-            fs::write(
-                root.join("lifecycle").join("shutdown.sh"),
+                "@echo off\r\necho init>> lifecycle.log\r\n",
+            );
+            write_script(
+                &root.join("lifecycle").join(&shutdown_name),
                 "#!/bin/sh\nprintf 'shutdown\\n' >> lifecycle.log\n",
-            )
-            .expect("write shutdown lifecycle");
+                "@echo off\r\necho shutdown>> lifecycle.log\r\n",
+            );
         }
 
-        let hooks = if include_hooks {
-            ",\n  \"hooks\": {\n    \"PreToolUse\": [\"./hooks/pre.sh\"]\n  }"
-        } else {
-            ""
-        };
-        let lifecycle = if include_lifecycle {
-            ",\n  \"lifecycle\": {\n    \"Init\": [\"./lifecycle/init.sh\"],\n    \"Shutdown\": [\"./lifecycle/shutdown.sh\"]\n  }"
-        } else {
-            ""
-        };
+        let mut manifest = json!({
+            "name": name,
+            "version": "1.0.0",
+            "description": "runtime plugin fixture",
+        });
+        if include_hooks {
+            manifest["hooks"] = json!({
+                "PreToolUse": [format!("./hooks/{pre_hook_name}")],
+            });
+        }
+        if include_lifecycle {
+            manifest["lifecycle"] = json!({
+                "Init": [format!("./lifecycle/{init_name}")],
+                "Shutdown": [format!("./lifecycle/{shutdown_name}")],
+            });
+        }
         fs::write(
             root.join(".claude-plugin").join("plugin.json"),
-            format!(
-                "{{\n  \"name\": \"{name}\",\n  \"version\": \"1.0.0\",\n  \"description\": \"runtime plugin fixture\"{hooks}{lifecycle}\n}}"
-            ),
+            serde_json::to_string_pretty(&manifest).expect("manifest should serialize"),
         )
         .expect("write plugin manifest");
     }
@@ -9145,8 +9341,15 @@ mod tests {
 
     #[test]
     fn rejects_unknown_allowed_tools() {
-        let error = parse_args(&["--allowedTools".to_string(), "teleport".to_string()])
-            .expect_err("tool should be rejected");
+        let _guard = env_lock();
+        let cwd = temp_dir();
+        fs::create_dir_all(&cwd).expect("temp cwd should exist");
+        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        let error = with_current_dir(&cwd, || {
+            parse_args(&["--allowedTools".to_string(), "teleport".to_string()])
+                .expect_err("tool should be rejected")
+        });
+        let _ = fs::remove_dir_all(cwd);
         assert!(error.contains("unsupported tool in --allowedTools: teleport"));
     }
 
@@ -9691,102 +9894,114 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn parses_direct_agents_mcp_and_skills_slash_commands() {
-        assert_eq!(
-            parse_args(&["/agents".to_string()]).expect("/agents should parse"),
-            CliAction::Agents {
-                args: None,
-                output_format: CliOutputFormat::Text
-            }
-        );
-        assert_eq!(
-            parse_args(&["/mcp".to_string(), "show".to_string(), "demo".to_string()])
-                .expect("/mcp show demo should parse"),
-            CliAction::Mcp {
-                args: Some("show demo".to_string()),
-                output_format: CliOutputFormat::Text,
-            }
-        );
-        assert_eq!(
-            parse_args(&["/skills".to_string()]).expect("/skills should parse"),
-            CliAction::Skills {
-                args: None,
-                output_format: CliOutputFormat::Text,
-            }
-        );
-        assert_eq!(
-            parse_args(&["/skill".to_string()]).expect("/skill should parse"),
-            CliAction::Skills {
-                args: None,
-                output_format: CliOutputFormat::Text,
-            }
-        );
-        assert_eq!(
-            parse_args(&["/skills".to_string(), "help".to_string()])
-                .expect("/skills help should parse"),
-            CliAction::Skills {
-                args: Some("help".to_string()),
-                output_format: CliOutputFormat::Text,
-            }
-        );
-        assert_eq!(
-            parse_args(&["/skill".to_string(), "list".to_string()])
-                .expect("/skill list should parse"),
-            CliAction::Skills {
-                args: Some("list".to_string()),
-                output_format: CliOutputFormat::Text,
-            }
-        );
-        assert_eq!(
-            parse_args(&[
-                "/skills".to_string(),
-                "help".to_string(),
-                "overview".to_string()
-            ])
-            .expect("/skills help overview should invoke"),
-            CliAction::Prompt {
-                prompt: "$help overview".to_string(),
-                model: DEFAULT_MODEL.to_string(),
-                output_format: CliOutputFormat::Text,
-                allowed_tools: None,
-                permission_mode: crate::default_permission_mode(),
-                compact: false,
-                base_commit: None,
-                reasoning_effort: None,
-                allow_broad_cwd: false,
-            }
-        );
-        assert_eq!(
-            parse_args(&[
-                "/skills".to_string(),
-                "install".to_string(),
-                "./fixtures/help-skill".to_string(),
-            ])
-            .expect("/skills install should parse"),
-            CliAction::Skills {
-                args: Some("install ./fixtures/help-skill".to_string()),
-                output_format: CliOutputFormat::Text,
-            }
-        );
-        assert_eq!(
-            parse_args(&["/skills".to_string(), "/test".to_string()])
-                .expect("/skills /test should normalize to a single skill prompt prefix"),
-            CliAction::Prompt {
-                prompt: "$test".to_string(),
-                model: DEFAULT_MODEL.to_string(),
-                output_format: CliOutputFormat::Text,
-                allowed_tools: None,
-                permission_mode: crate::default_permission_mode(),
-                compact: false,
-                base_commit: None,
-                reasoning_effort: None,
-                allow_broad_cwd: false,
-            }
-        );
-        let error = parse_args(&["/status".to_string()])
-            .expect_err("/status should remain REPL-only when invoked directly");
-        assert!(error.contains("interactive-only"));
-        assert!(error.contains("claw --resume SESSION.jsonl /status"));
+        let _guard = env_lock();
+        let cwd = temp_dir();
+        fs::create_dir_all(&cwd).expect("temp cwd should exist");
+        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+
+        with_current_dir(&cwd, || {
+            let permission_mode = crate::default_permission_mode();
+
+            assert_eq!(
+                parse_args(&["/agents".to_string()]).expect("/agents should parse"),
+                CliAction::Agents {
+                    args: None,
+                    output_format: CliOutputFormat::Text
+                }
+            );
+            assert_eq!(
+                parse_args(&["/mcp".to_string(), "show".to_string(), "demo".to_string()])
+                    .expect("/mcp show demo should parse"),
+                CliAction::Mcp {
+                    args: Some("show demo".to_string()),
+                    output_format: CliOutputFormat::Text,
+                }
+            );
+            assert_eq!(
+                parse_args(&["/skills".to_string()]).expect("/skills should parse"),
+                CliAction::Skills {
+                    args: None,
+                    output_format: CliOutputFormat::Text,
+                }
+            );
+            assert_eq!(
+                parse_args(&["/skill".to_string()]).expect("/skill should parse"),
+                CliAction::Skills {
+                    args: None,
+                    output_format: CliOutputFormat::Text,
+                }
+            );
+            assert_eq!(
+                parse_args(&["/skills".to_string(), "help".to_string()])
+                    .expect("/skills help should parse"),
+                CliAction::Skills {
+                    args: Some("help".to_string()),
+                    output_format: CliOutputFormat::Text,
+                }
+            );
+            assert_eq!(
+                parse_args(&["/skill".to_string(), "list".to_string()])
+                    .expect("/skill list should parse"),
+                CliAction::Skills {
+                    args: Some("list".to_string()),
+                    output_format: CliOutputFormat::Text,
+                }
+            );
+            assert_eq!(
+                parse_args(&[
+                    "/skills".to_string(),
+                    "help".to_string(),
+                    "overview".to_string()
+                ])
+                .expect("/skills help overview should invoke"),
+                CliAction::Prompt {
+                    prompt: "$help overview".to_string(),
+                    model: DEFAULT_MODEL.to_string(),
+                    output_format: CliOutputFormat::Text,
+                    allowed_tools: None,
+                    permission_mode,
+                    compact: false,
+                    base_commit: None,
+                    reasoning_effort: None,
+                    allow_broad_cwd: false,
+                }
+            );
+            assert_eq!(
+                parse_args(&[
+                    "/skills".to_string(),
+                    "install".to_string(),
+                    "./fixtures/help-skill".to_string(),
+                ])
+                .expect("/skills install should parse"),
+                CliAction::Skills {
+                    args: Some("install ./fixtures/help-skill".to_string()),
+                    output_format: CliOutputFormat::Text,
+                }
+            );
+            assert_eq!(
+                parse_args(&["/skills".to_string(), "/test".to_string()])
+                    .expect("/skills /test should normalize to a single skill prompt prefix"),
+                CliAction::Prompt {
+                    prompt: "$test".to_string(),
+                    model: DEFAULT_MODEL.to_string(),
+                    output_format: CliOutputFormat::Text,
+                    allowed_tools: None,
+                    permission_mode,
+                    compact: false,
+                    base_commit: None,
+                    reasoning_effort: None,
+                    allow_broad_cwd: false,
+                }
+            );
+            let error = parse_args(&["/status".to_string()])
+                .expect_err("/status should remain REPL-only when invoked directly");
+            assert!(error.contains("interactive-only"));
+            assert!(error.contains("claw --resume SESSION.jsonl /status"));
+        });
+
+        let _ = fs::remove_dir_all(cwd);
     }
 
     #[test]
@@ -11376,7 +11591,7 @@ UU conflicted.rs",
         let pre_hooks = state.feature_config.hooks().pre_tool_use();
         assert_eq!(pre_hooks.len(), 1);
         assert!(
-            pre_hooks[0].ends_with("hooks/pre.sh"),
+            pre_hooks[0].ends_with(&format!("hooks/{}", script_name("pre"))),
             "expected installed plugin hook path, got {pre_hooks:?}"
         );
 
@@ -11388,6 +11603,7 @@ UU conflicted.rs",
     #[test]
     #[allow(clippy::too_many_lines)]
     fn build_runtime_plugin_state_discovers_mcp_tools_and_surfaces_pending_servers() {
+        let _guard = env_lock();
         let config_home = temp_dir();
         let workspace = temp_dir();
         fs::create_dir_all(&config_home).expect("config home");
@@ -11396,21 +11612,19 @@ UU conflicted.rs",
         write_mcp_server_fixture(&script_path);
         fs::write(
             config_home.join("settings.json"),
-            format!(
-                r#"{{
-                  "mcpServers": {{
-                    "alpha": {{
-                      "command": "python3",
-                      "args": ["{}"]
-                    }},
-                    "broken": {{
-                      "command": "python3",
-                      "args": ["-c", "import sys; sys.exit(0)"]
-                    }}
-                  }}
-                }}"#,
-                script_path.to_string_lossy()
-            ),
+            serde_json::to_string_pretty(&json!({
+                "mcpServers": {
+                    "alpha": {
+                        "command": python_command(),
+                        "args": [script_path.to_string_lossy().to_string()],
+                    },
+                    "broken": {
+                        "command": python_command(),
+                        "args": ["-c", "import sys; sys.exit(0)"],
+                    }
+                }
+            }))
+            .expect("mcp settings should serialize"),
         )
         .expect("write mcp settings");
 
@@ -11596,7 +11810,9 @@ UU conflicted.rs",
         .expect("runtime should build");
 
         assert_eq!(
-            fs::read_to_string(&log_path).expect("init log should exist"),
+            fs::read_to_string(&log_path)
+                .expect("init log should exist")
+                .replace("\r\n", "\n"),
             "init\n"
         );
 
@@ -11605,7 +11821,9 @@ UU conflicted.rs",
             .expect("plugin shutdown should succeed");
 
         assert_eq!(
-            fs::read_to_string(&log_path).expect("shutdown log should exist"),
+            fs::read_to_string(&log_path)
+                .expect("shutdown log should exist")
+                .replace("\r\n", "\n"),
             "init\nshutdown\n"
         );
 

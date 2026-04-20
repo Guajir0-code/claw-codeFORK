@@ -212,7 +212,7 @@ fn summarize_messages(messages: &[ConversationMessage]) -> String {
         .filter_map(|block| match block {
             ContentBlock::ToolUse { name, .. } => Some(name.as_str()),
             ContentBlock::ToolResult { tool_name, .. } => Some(tool_name.as_str()),
-            ContentBlock::Text { .. } => None,
+            ContentBlock::Text { .. } | ContentBlock::VerificationReport { .. } => None,
         })
         .collect::<Vec<_>>();
     tool_names.sort_unstable();
@@ -266,6 +266,7 @@ fn summarize_messages(messages: &[ConversationMessage]) -> String {
             MessageRole::User => "user",
             MessageRole::Assistant => "assistant",
             MessageRole::Tool => "tool",
+            MessageRole::Verification => "verification",
         };
         let content = message
             .blocks
@@ -327,6 +328,16 @@ fn summarize_block(block: &ContentBlock) -> String {
             "tool_result {tool_name}: {}{output}",
             if *is_error { "error " } else { "" }
         ),
+        ContentBlock::VerificationReport {
+            phase,
+            status,
+            summary_text,
+            ..
+        } => format!(
+            "verification {} {}: {summary_text}",
+            phase.as_str(),
+            status.as_str()
+        ),
     };
     truncate_summary(&raw, 160)
 }
@@ -378,6 +389,7 @@ fn collect_key_files(messages: &[ConversationMessage]) -> Vec<String> {
             ContentBlock::Text { text } => text.as_str(),
             ContentBlock::ToolUse { input, .. } => input.as_str(),
             ContentBlock::ToolResult { output, .. } => output.as_str(),
+            ContentBlock::VerificationReport { summary_text, .. } => summary_text.as_str(),
         })
         .flat_map(extract_file_candidates)
         .collect::<Vec<_>>();
@@ -400,6 +412,7 @@ fn first_text_block(message: &ConversationMessage) -> Option<&str> {
         ContentBlock::Text { text } if !text.trim().is_empty() => Some(text.as_str()),
         ContentBlock::ToolUse { .. }
         | ContentBlock::ToolResult { .. }
+        | ContentBlock::VerificationReport { .. }
         | ContentBlock::Text { .. } => None,
     })
 }
@@ -450,6 +463,7 @@ fn estimate_message_tokens(message: &ConversationMessage) -> usize {
             ContentBlock::ToolResult {
                 tool_name, output, ..
             } => (tool_name.len() + output.len()) / 4 + 1,
+            ContentBlock::VerificationReport { summary_text, .. } => summary_text.len() / 4 + 1,
         })
         .sum()
 }

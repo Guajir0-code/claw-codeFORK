@@ -70,29 +70,60 @@ pub struct RuntimeFeatureConfig {
 
 /// Settings for the post-edit self-verification loop.
 ///
-/// When enabled, the runtime runs cargo-based checks on the crate owning a
-/// freshly edited Rust file and injects the result into the tool output so
-/// the assistant can react on the next iteration.
+/// When enabled, the runtime runs staged multi-language verification for
+/// successful edits and can block turn completion on a final validation gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeVerifierMode {
+    Legacy,
+    Staged,
+}
+
+impl RuntimeVerifierMode {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Legacy => "legacy",
+            Self::Staged => "staged",
+        }
+    }
+}
+
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeVerifierConfig {
     enabled: bool,
+    mode: RuntimeVerifierMode,
+    quick_on_write: bool,
+    final_gate: bool,
+    max_output_bytes: usize,
     run_check: bool,
     run_clippy: bool,
     run_fmt: bool,
     run_test: bool,
     timeout_secs: u64,
+    node_enabled: bool,
+    node_timeout_secs: u64,
+    python_enabled: bool,
+    python_timeout_secs: u64,
 }
 
 impl Default for RuntimeVerifierConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            mode: RuntimeVerifierMode::Legacy,
+            quick_on_write: true,
+            final_gate: false,
+            max_output_bytes: 2_048,
             run_check: true,
             run_clippy: true,
             run_fmt: true,
             run_test: true,
             timeout_secs: 120,
+            node_enabled: true,
+            node_timeout_secs: 120,
+            python_enabled: true,
+            python_timeout_secs: 120,
         }
     }
 }
@@ -101,6 +132,31 @@ impl RuntimeVerifierConfig {
     #[must_use]
     pub fn enabled(&self) -> bool {
         self.enabled
+    }
+
+    #[must_use]
+    pub fn mode(&self) -> RuntimeVerifierMode {
+        self.mode
+    }
+
+    #[must_use]
+    pub fn staged(&self) -> bool {
+        self.mode == RuntimeVerifierMode::Staged
+    }
+
+    #[must_use]
+    pub fn quick_on_write(&self) -> bool {
+        self.quick_on_write
+    }
+
+    #[must_use]
+    pub fn final_gate(&self) -> bool {
+        self.final_gate
+    }
+
+    #[must_use]
+    pub fn max_output_bytes(&self) -> usize {
+        self.max_output_bytes
     }
 
     #[must_use]
@@ -126,6 +182,26 @@ impl RuntimeVerifierConfig {
     #[must_use]
     pub fn timeout_secs(&self) -> u64 {
         self.timeout_secs
+    }
+
+    #[must_use]
+    pub fn node_enabled(&self) -> bool {
+        self.node_enabled
+    }
+
+    #[must_use]
+    pub fn node_timeout_secs(&self) -> u64 {
+        self.node_timeout_secs
+    }
+
+    #[must_use]
+    pub fn python_enabled(&self) -> bool {
+        self.python_enabled
+    }
+
+    #[must_use]
+    pub fn python_timeout_secs(&self) -> u64 {
+        self.python_timeout_secs
     }
 }
 
@@ -869,6 +945,37 @@ fn parse_optional_verifier_config(root: &JsonValue) -> Result<RuntimeVerifierCon
     if let Some(enabled) = optional_bool(verifier, "enabled", "merged settings.verifier")? {
         config.enabled = enabled;
     }
+    if let Some(mode) = optional_string(verifier, "mode", "merged settings.verifier")? {
+        config.mode = match mode {
+            "legacy" => RuntimeVerifierMode::Legacy,
+            "staged" => RuntimeVerifierMode::Staged,
+            other => {
+                return Err(ConfigError::Parse(format!(
+                    "merged settings.verifier.mode must be legacy or staged, got `{other}`"
+                )))
+            }
+        };
+    }
+    if let Some(quick_on_write) =
+        optional_bool(verifier, "quickOnWrite", "merged settings.verifier")?
+    {
+        config.quick_on_write = quick_on_write;
+    }
+    if let Some(final_gate) = optional_bool(verifier, "finalGate", "merged settings.verifier")? {
+        config.final_gate = final_gate;
+        if final_gate && config.mode == RuntimeVerifierMode::Legacy {
+            config.mode = RuntimeVerifierMode::Staged;
+        }
+    }
+    if let Some(max_output_bytes) =
+        optional_u64(verifier, "maxOutputBytes", "merged settings.verifier")?
+    {
+        config.max_output_bytes = usize::try_from(max_output_bytes).map_err(|_| {
+            ConfigError::Parse(
+                "merged settings.verifier.maxOutputBytes is out of range".to_string(),
+            )
+        })?;
+    }
     if let Some(cargo_value) = verifier.get("cargo") {
         let cargo = expect_object(cargo_value, "merged settings.verifier.cargo")?;
         if let Some(v) = optional_bool(cargo, "check", "merged settings.verifier.cargo")? {
@@ -885,6 +992,24 @@ fn parse_optional_verifier_config(root: &JsonValue) -> Result<RuntimeVerifierCon
         }
         if let Some(v) = optional_u64(cargo, "timeoutSecs", "merged settings.verifier.cargo")? {
             config.timeout_secs = v;
+        }
+    }
+    if let Some(node_value) = verifier.get("node") {
+        let node = expect_object(node_value, "merged settings.verifier.node")?;
+        if let Some(v) = optional_bool(node, "enabled", "merged settings.verifier.node")? {
+            config.node_enabled = v;
+        }
+        if let Some(v) = optional_u64(node, "timeoutSecs", "merged settings.verifier.node")? {
+            config.node_timeout_secs = v;
+        }
+    }
+    if let Some(python_value) = verifier.get("python") {
+        let python = expect_object(python_value, "merged settings.verifier.python")?;
+        if let Some(v) = optional_bool(python, "enabled", "merged settings.verifier.python")? {
+            config.python_enabled = v;
+        }
+        if let Some(v) = optional_u64(python, "timeoutSecs", "merged settings.verifier.python")? {
+            config.python_timeout_secs = v;
         }
     }
     Ok(config)
@@ -1359,7 +1484,7 @@ mod tests {
     use super::{
         deep_merge_objects, parse_permission_mode_label, ConfigLoader, ConfigSource,
         McpServerConfig, McpTransport, ResolvedPermissionMode, RuntimeHookConfig,
-        RuntimePluginConfig, CLAW_SETTINGS_SCHEMA_NAME,
+        RuntimePluginConfig, RuntimeVerifierMode, CLAW_SETTINGS_SCHEMA_NAME,
     };
     use crate::json::JsonValue;
     use crate::sandbox::FilesystemIsolationMode;
@@ -2218,6 +2343,96 @@ mod tests {
             rendered.contains("model"),
             "error should suggest the closest known key, got: {rendered}"
         );
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn loads_staged_multi_language_verifier_settings() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        let user_settings = home.join("settings.json");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::write(
+            &user_settings,
+            r#"{
+  "verifier": {
+    "enabled": true,
+    "mode": "staged",
+    "quickOnWrite": false,
+    "finalGate": true,
+    "maxOutputBytes": 4096,
+    "cargo": {
+      "check": true,
+      "clippy": false,
+      "fmt": true,
+      "test": false,
+      "timeoutSecs": 33
+    },
+    "node": {
+      "enabled": false,
+      "timeoutSecs": 44
+    },
+    "python": {
+      "enabled": true,
+      "timeoutSecs": 55
+    }
+  }
+}"#,
+        )
+        .expect("write user settings");
+
+        let config = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should parse");
+        let verifier = config.verifier();
+
+        assert!(verifier.enabled());
+        assert_eq!(verifier.mode(), RuntimeVerifierMode::Staged);
+        assert!(!verifier.quick_on_write());
+        assert!(verifier.final_gate());
+        assert_eq!(verifier.max_output_bytes(), 4096);
+        assert!(verifier.run_check());
+        assert!(!verifier.run_clippy());
+        assert!(verifier.run_fmt());
+        assert!(!verifier.run_test());
+        assert_eq!(verifier.timeout_secs(), 33);
+        assert!(!verifier.node_enabled());
+        assert_eq!(verifier.node_timeout_secs(), 44);
+        assert!(verifier.python_enabled());
+        assert_eq!(verifier.python_timeout_secs(), 55);
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn final_gate_promotes_legacy_default_to_staged() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        let user_settings = home.join("settings.json");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::write(
+            &user_settings,
+            r#"{
+  "verifier": {
+    "enabled": true,
+    "finalGate": true
+  }
+}"#,
+        )
+        .expect("write user settings");
+
+        let config = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should parse");
+
+        assert_eq!(config.verifier().mode(), RuntimeVerifierMode::Staged);
+        assert!(config.verifier().staged());
+        assert!(config.verifier().final_gate());
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }

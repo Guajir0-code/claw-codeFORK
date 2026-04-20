@@ -4742,7 +4742,10 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
         .iter()
         .filter_map(|message| {
             let role = match message.role {
-                MessageRole::System | MessageRole::User | MessageRole::Tool => "user",
+                MessageRole::System
+                | MessageRole::User
+                | MessageRole::Tool
+                | MessageRole::Verification => "user",
                 MessageRole::Assistant => "assistant",
             };
             let content = message
@@ -4768,6 +4771,11 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
                         }],
                         is_error: *is_error,
                     },
+                    ContentBlock::VerificationReport { summary_text, .. } => {
+                        InputContentBlock::Text {
+                            text: summary_text.clone(),
+                        }
+                    }
                 })
                 .collect::<Vec<_>>();
             (!content.is_empty()).then(|| InputMessage {
@@ -6139,6 +6147,22 @@ mod tests {
     };
     use serde_json::json;
 
+    #[cfg(unix)]
+    fn make_executable(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut permissions = fs::metadata(path)
+            .expect("script metadata should load")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).expect("script permissions should update");
+    }
+
+    #[cfg(not(unix))]
+    fn make_executable(path: &Path) {
+        let _ = path;
+    }
+
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
@@ -6168,6 +6192,18 @@ mod tests {
             .expect("time")
             .as_nanos();
         std::env::temp_dir().join(format!("clawd-tools-{unique}-{name}"))
+    }
+
+    fn normalized_test_path(path: &str) -> String {
+        path.replace('\\', "/")
+    }
+
+    fn assert_path_suffix(value: &serde_json::Value, suffix: &str) {
+        let path = value.as_str().expect("path");
+        assert!(
+            normalized_test_path(path).ends_with(suffix),
+            "expected path `{path}` to end with `{suffix}`"
+        );
     }
 
     fn run_git(cwd: &Path, args: &[&str]) {
@@ -6333,10 +6369,12 @@ mod tests {
         let worktree = temp_path("config-trust-worktree");
         let claw_dir = worktree.join(".claw");
         fs::create_dir_all(&claw_dir).expect("create .claw dir");
-        // Use the actual OS temp dir so the worktree path matches the allowlist
         let tmp_root = std::env::temp_dir().to_str().expect("utf-8").to_string();
-        let settings = format!("{{\"trustedRoots\": [\"{tmp_root}\"]}}");
-        fs::write(claw_dir.join("settings.json"), settings).expect("write settings");
+        fs::write(
+            claw_dir.join("settings.json"),
+            json!({ "trustedRoots": [tmp_root] }).to_string(),
+        )
+        .expect("write settings");
 
         // WorkerCreate with no per-call trusted_roots — config should supply them
         let cwd = worktree.to_str().expect("valid utf-8").to_string();
@@ -6350,7 +6388,6 @@ mod tests {
         .expect("WorkerCreate should succeed");
         let output: serde_json::Value = serde_json::from_str(&created).expect("json");
 
-        // worktree is under /tmp, so config roots auto-resolve trust
         assert_eq!(
             output["trust_auto_resolve"], true,
             "config-level trustedRoots should auto-resolve trust without per-call override"
@@ -7305,10 +7342,7 @@ mod tests {
 
         let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
         assert_eq!(output["skill"], "help");
-        assert!(output["path"]
-            .as_str()
-            .expect("path")
-            .ends_with("/help/SKILL.md"));
+        assert_path_suffix(&output["path"], "/help/SKILL.md");
         assert!(output["prompt"]
             .as_str()
             .expect("prompt")
@@ -7324,10 +7358,7 @@ mod tests {
         let dollar_output: serde_json::Value =
             serde_json::from_str(&dollar_result).expect("valid json");
         assert_eq!(dollar_output["skill"], "$help");
-        assert!(dollar_output["path"]
-            .as_str()
-            .expect("path")
-            .ends_with("/help/SKILL.md"));
+        assert_path_suffix(&dollar_output["path"], "/help/SKILL.md");
 
         if let Some(home) = original_home {
             std::env::set_var("HOME", home);
@@ -7363,19 +7394,13 @@ mod tests {
             .expect("project-local skill should resolve");
         let skill_output: serde_json::Value =
             serde_json::from_str(&skill_result).expect("valid json");
-        assert!(skill_output["path"]
-            .as_str()
-            .expect("path")
-            .ends_with(".claw/skills/plan/SKILL.md"));
+        assert_path_suffix(&skill_output["path"], ".claw/skills/plan/SKILL.md");
 
         let command_result = execute_tool("Skill", &json!({ "skill": "/handoff" }))
             .expect("legacy command should resolve");
         let command_output: serde_json::Value =
             serde_json::from_str(&command_result).expect("valid json");
-        assert!(command_output["path"]
-            .as_str()
-            .expect("path")
-            .ends_with(".claw/commands/handoff.md"));
+        assert_path_suffix(&command_output["path"], ".claw/commands/handoff.md");
 
         std::env::set_current_dir(&original_dir).expect("restore cwd");
         fs::remove_dir_all(root).expect("temp project should clean up");
@@ -7410,10 +7435,7 @@ mod tests {
             .expect("project-local skill should resolve");
 
         let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
-        assert!(output["path"]
-            .as_str()
-            .expect("path")
-            .ends_with(".claude/skills/trace/SKILL.md"));
+        assert_path_suffix(&output["path"], ".claude/skills/trace/SKILL.md");
         assert_eq!(output["description"], "Project-local trace helper");
 
         std::env::set_current_dir(&original_dir).expect("restore cwd");
@@ -7472,15 +7494,9 @@ mod tests {
         let omc_output: serde_json::Value = serde_json::from_str(&omc_result).expect("valid json");
         let agents_output: serde_json::Value =
             serde_json::from_str(&agents_result).expect("valid json");
-        assert!(omc_output["path"]
-            .as_str()
-            .expect("path")
-            .ends_with(".omc/skills/hud/SKILL.md"));
+        assert_path_suffix(&omc_output["path"], ".omc/skills/hud/SKILL.md");
         assert_eq!(omc_output["description"], "Project-local OMC HUD helper");
-        assert!(agents_output["path"]
-            .as_str()
-            .expect("path")
-            .ends_with(".agents/skills/trace/SKILL.md"));
+        assert_path_suffix(&agents_output["path"], ".agents/skills/trace/SKILL.md");
         assert_eq!(
             agents_output["description"],
             "Project-local agents compatibility helper"
@@ -7532,10 +7548,7 @@ mod tests {
             .expect("learned skill should resolve");
 
         let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
-        assert!(output["path"]
-            .as_str()
-            .expect("path")
-            .ends_with("skills/omc-learned/learned/SKILL.md"));
+        assert_path_suffix(&output["path"], "skills/omc-learned/learned/SKILL.md");
         assert_eq!(output["description"], "Learned OMC skill");
 
         match original_home {
@@ -7591,20 +7604,14 @@ mod tests {
             execute_tool("Skill", &json!({ "skill": "statusline" })).expect("direct skill");
         let direct_skill_output: serde_json::Value =
             serde_json::from_str(&direct_skill).expect("valid skill json");
-        assert!(direct_skill_output["path"]
-            .as_str()
-            .expect("path")
-            .ends_with("skills/statusline/SKILL.md"));
+        assert_path_suffix(&direct_skill_output["path"], "skills/statusline/SKILL.md");
         assert_eq!(direct_skill_output["description"], "Claude config skill");
 
         let legacy_command =
             execute_tool("Skill", &json!({ "skill": "doctor-check" })).expect("direct command");
         let legacy_command_output: serde_json::Value =
             serde_json::from_str(&legacy_command).expect("valid command json");
-        assert!(legacy_command_output["path"]
-            .as_str()
-            .expect("path")
-            .ends_with("commands/doctor-check.md"));
+        assert_path_suffix(&legacy_command_output["path"], "commands/doctor-check.md");
         assert_eq!(
             legacy_command_output["description"],
             "Claude config command"
@@ -7658,10 +7665,7 @@ mod tests {
             .expect("legacy command markdown should resolve");
 
         let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
-        assert!(output["path"]
-            .as_str()
-            .expect("path")
-            .ends_with(".claude/commands/team.md"));
+        assert_path_suffix(&output["path"], ".claude/commands/team.md");
         assert_eq!(output["description"], "Legacy team workflow");
 
         std::env::set_current_dir(&original_dir).expect("restore cwd");
@@ -8858,10 +8862,7 @@ mod tests {
             .expect("glob should succeed");
         let globbed_output: serde_json::Value = serde_json::from_str(&globbed).expect("json");
         assert_eq!(globbed_output["numFiles"], 1);
-        assert!(globbed_output["filenames"][0]
-            .as_str()
-            .expect("filename")
-            .ends_with("nested/lib.rs"));
+        assert_path_suffix(&globbed_output["filenames"][0], "nested/lib.rs");
 
         let glob_error = execute_tool("glob_search", &json!({ "pattern": "[" }))
             .expect_err("invalid glob should fail");
@@ -9240,24 +9241,18 @@ mod tests {
                 .expect("time")
                 .as_nanos()
         ));
-        std::fs::create_dir_all(&dir).expect("create dir");
-        let script = dir.join("pwsh");
-        std::fs::write(
-            &script,
-            r#"#!/bin/sh
-while [ "$1" != "-Command" ] && [ $# -gt 0 ]; do shift; done
-shift
-printf 'pwsh:%s' "$1"
-"#,
-        )
-        .expect("write script");
-        std::process::Command::new("/bin/chmod")
-            .arg("+x")
-            .arg(&script)
-            .status()
-            .expect("chmod");
         let original_path = std::env::var("PATH").unwrap_or_default();
-        std::env::set_var("PATH", format!("{}:{}", dir.display(), original_path));
+        if !cfg!(windows) {
+            std::fs::create_dir_all(&dir).expect("create dir");
+            let script = dir.join("powershell");
+            std::fs::write(
+                &script,
+                "#!/bin/sh\nwhile [ \"$1\" != \"-Command\" ] && [ $# -gt 0 ]; do shift; done\nshift\nprintf 'pwsh:%s' \"$1\"\n",
+            )
+            .expect("write script");
+            make_executable(&script);
+            std::env::set_var("PATH", format!("{}:{}", dir.display(), original_path));
+        }
 
         let result = execute_tool(
             "PowerShell",
@@ -9271,11 +9266,21 @@ printf 'pwsh:%s' "$1"
         )
         .expect("PowerShell background should succeed");
 
-        std::env::set_var("PATH", original_path);
-        let _ = std::fs::remove_dir_all(dir);
+        if !cfg!(windows) {
+            std::env::set_var("PATH", original_path);
+            let _ = std::fs::remove_dir_all(dir);
+        }
 
         let output: serde_json::Value = serde_json::from_str(&result).expect("json");
-        assert_eq!(output["stdout"], "pwsh:Write-Output hello");
+        let stdout = output["stdout"]
+            .as_str()
+            .expect("stdout")
+            .replace("\r\n", "\n");
+        if cfg!(windows) {
+            assert_eq!(stdout, "hello\n");
+        } else {
+            assert_eq!(stdout, "pwsh:Write-Output hello");
+        }
         assert!(output["stderr"].as_str().expect("stderr").is_empty());
 
         let background_output: serde_json::Value = serde_json::from_str(&background).expect("json");

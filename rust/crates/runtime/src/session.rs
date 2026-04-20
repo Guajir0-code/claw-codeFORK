@@ -8,6 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::json::{JsonError, JsonValue};
 use crate::usage::TokenUsage;
+use crate::verifier::{VerificationPhase, VerificationReport, VerificationStatus};
 
 const SESSION_VERSION: u32 = 1;
 const ROTATE_AFTER_BYTES: u64 = 256 * 1024;
@@ -22,6 +23,7 @@ pub enum MessageRole {
     User,
     Assistant,
     Tool,
+    Verification,
 }
 
 /// Structured message content stored inside a [`Session`].
@@ -40,6 +42,12 @@ pub enum ContentBlock {
         tool_name: String,
         output: String,
         is_error: bool,
+    },
+    VerificationReport {
+        report_id: String,
+        phase: VerificationPhase,
+        status: VerificationStatus,
+        summary_text: String,
     },
 }
 
@@ -669,6 +677,20 @@ impl ConversationMessage {
     }
 
     #[must_use]
+    pub fn verification_report(report: &VerificationReport) -> Self {
+        Self {
+            role: MessageRole::Verification,
+            blocks: vec![ContentBlock::VerificationReport {
+                report_id: report.report_id.clone(),
+                phase: report.phase,
+                status: report.status,
+                summary_text: report.summary_text.clone(),
+            }],
+            usage: None,
+        }
+    }
+
+    #[must_use]
     pub fn to_json(&self) -> JsonValue {
         let mut object = BTreeMap::new();
         object.insert(
@@ -679,6 +701,7 @@ impl ConversationMessage {
                     MessageRole::User => "user",
                     MessageRole::Assistant => "assistant",
                     MessageRole::Tool => "tool",
+                    MessageRole::Verification => "verification",
                 }
                 .to_string(),
             ),
@@ -706,6 +729,7 @@ impl ConversationMessage {
             "user" => MessageRole::User,
             "assistant" => MessageRole::Assistant,
             "tool" => MessageRole::Tool,
+            "verification" => MessageRole::Verification,
             other => {
                 return Err(SessionError::Format(format!(
                     "unsupported message role: {other}"
@@ -767,6 +791,33 @@ impl ContentBlock {
                 object.insert("output".to_string(), JsonValue::String(output.clone()));
                 object.insert("is_error".to_string(), JsonValue::Bool(*is_error));
             }
+            Self::VerificationReport {
+                report_id,
+                phase,
+                status,
+                summary_text,
+            } => {
+                object.insert(
+                    "type".to_string(),
+                    JsonValue::String("verification_report".to_string()),
+                );
+                object.insert(
+                    "report_id".to_string(),
+                    JsonValue::String(report_id.clone()),
+                );
+                object.insert(
+                    "phase".to_string(),
+                    JsonValue::String(phase.as_str().to_string()),
+                );
+                object.insert(
+                    "status".to_string(),
+                    JsonValue::String(status.as_str().to_string()),
+                );
+                object.insert(
+                    "summary_text".to_string(),
+                    JsonValue::String(summary_text.clone()),
+                );
+            }
         }
         JsonValue::Object(object)
     }
@@ -796,6 +847,12 @@ impl ContentBlock {
                     .get("is_error")
                     .and_then(JsonValue::as_bool)
                     .ok_or_else(|| SessionError::Format("missing is_error".to_string()))?,
+            }),
+            "verification_report" => Ok(Self::VerificationReport {
+                report_id: required_string(object, "report_id")?,
+                phase: parse_verification_phase(&required_string(object, "phase")?)?,
+                status: parse_verification_status(&required_string(object, "status")?)?,
+                summary_text: required_string(object, "summary_text")?,
             }),
             other => Err(SessionError::Format(format!(
                 "unsupported block type: {other}"
@@ -968,6 +1025,28 @@ fn required_string(
         .and_then(JsonValue::as_str)
         .map(ToOwned::to_owned)
         .ok_or_else(|| SessionError::Format(format!("missing {key}")))
+}
+
+fn parse_verification_phase(value: &str) -> Result<VerificationPhase, SessionError> {
+    match value {
+        "quick" => Ok(VerificationPhase::Quick),
+        "final" => Ok(VerificationPhase::Final),
+        other => Err(SessionError::Format(format!(
+            "unsupported verification phase: {other}"
+        ))),
+    }
+}
+
+fn parse_verification_status(value: &str) -> Result<VerificationStatus, SessionError> {
+    match value {
+        "passed" => Ok(VerificationStatus::Passed),
+        "failed" => Ok(VerificationStatus::Failed),
+        "skipped" => Ok(VerificationStatus::Skipped),
+        "unavailable" => Ok(VerificationStatus::Unavailable),
+        other => Err(SessionError::Format(format!(
+            "unsupported verification status: {other}"
+        ))),
+    }
 }
 
 fn required_u32(object: &BTreeMap<String, JsonValue>, key: &str) -> Result<u32, SessionError> {

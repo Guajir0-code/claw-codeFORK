@@ -141,9 +141,22 @@ fn run_claw(
         .env("CLAW_CONFIG_HOME", config_home)
         .env("HOME", home)
         .env("NO_COLOR", "1")
-        .env("PATH", "/usr/bin:/bin")
         .args(args);
+    configure_clean_process_env(&mut command, home);
     command.output().expect("claw should launch")
+}
+
+fn configure_clean_process_env(command: &mut Command, home: &std::path::Path) {
+    if cfg!(windows) {
+        command.env("USERPROFILE", home);
+        for key in ["PATH", "SystemRoot", "ComSpec", "PATHEXT", "TEMP", "TMP"] {
+            if let Ok(value) = std::env::var(key) {
+                command.env(key, value);
+            }
+        }
+    } else {
+        command.env("PATH", "/usr/bin:/bin");
+    }
 }
 
 fn unique_temp_dir(label: &str) -> PathBuf {

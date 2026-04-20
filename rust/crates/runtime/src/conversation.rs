@@ -1,5 +1,6 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{Display, Formatter};
+use std::path::PathBuf;
 
 use serde_json::{Map, Value};
 use telemetry::SessionTracer;
@@ -14,7 +15,10 @@ use crate::permissions::{
 };
 use crate::session::{ContentBlock, ConversationMessage, Session};
 use crate::usage::{TokenUsage, UsageTracker};
-use crate::verifier::{prepend_verifier_summary, Verifier};
+use crate::verifier::{
+    prepend_verifier_summary, VerificationContext, VerificationGateStatus, VerificationPhase,
+    VerificationReport, VerificationStatus, Verifier,
+};
 
 const DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD: u32 = 100_000;
 const AUTO_COMPACTION_THRESHOLD_ENV_VAR: &str = "CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS";
@@ -111,6 +115,8 @@ impl std::error::Error for RuntimeError {}
 pub struct TurnSummary {
     pub assistant_messages: Vec<ConversationMessage>,
     pub tool_results: Vec<ConversationMessage>,
+    pub verification_reports: Vec<VerificationReport>,
+    pub verification_gate: VerificationGateStatus,
     pub prompt_cache_events: Vec<PromptCacheEvent>,
     pub iterations: usize,
     pub usage: TokenUsage,
@@ -121,6 +127,35 @@ pub struct TurnSummary {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AutoCompactionEvent {
     pub removed_message_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct VerificationLedgerKey {
+    adapter_id: String,
+    project_root: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VerificationLedgerEntry {
+    adapter_id: String,
+    project_root: PathBuf,
+    touched_paths: BTreeSet<PathBuf>,
+    last_mutation_sequence: u64,
+    last_quick_status: Option<VerificationStatus>,
+    last_final_status: Option<VerificationStatus>,
+    last_final_verified_sequence: Option<u64>,
+}
+
+impl VerificationLedgerEntry {
+    fn update_from_report(&mut self, report: &VerificationReport, mutation_sequence: u64) {
+        self.last_mutation_sequence = mutation_sequence;
+        self.last_quick_status = Some(report.status);
+        self.last_final_status = None;
+        self.last_final_verified_sequence = None;
+        for path in &report.touched_paths {
+            self.touched_paths.insert(path.clone());
+        }
+    }
 }
 
 /// Coordinates the model loop, tool execution, hooks, and session updates.
@@ -319,6 +354,86 @@ where
         }
     }
 
+    fn workspace_root(&self) -> Option<PathBuf> {
+        self.session.workspace_root().map(PathBuf::from)
+    }
+
+    fn run_quick_verification(
+        &self,
+        tool_name: &str,
+        tool_input: &str,
+        mutation_sequence: u64,
+    ) -> Vec<VerificationReport> {
+        let Some(verifier) = self.verifier.as_ref() else {
+            return Vec::new();
+        };
+        let Some(context) = VerificationContext::from_tool_invocation(
+            VerificationPhase::Quick,
+            self.workspace_root(),
+            tool_name.to_string(),
+            tool_input.to_string(),
+            mutation_sequence,
+        ) else {
+            return Vec::new();
+        };
+        verifier.quick_verify(&context)
+    }
+
+    fn persist_verification_report(
+        &mut self,
+        report: &VerificationReport,
+    ) -> Result<(), RuntimeError> {
+        self.session
+            .push_message(ConversationMessage::verification_report(report))
+            .map_err(|error| RuntimeError::new(error.to_string()))
+    }
+
+    fn run_final_verification(
+        &self,
+        entry: &VerificationLedgerEntry,
+    ) -> Option<VerificationReport> {
+        self.verifier.as_ref().and_then(|verifier| {
+            verifier.final_verify(&crate::verifier::VerificationTarget {
+                adapter_id: entry.adapter_id.clone(),
+                project_root: entry.project_root.clone(),
+                touched_paths: entry.touched_paths.iter().cloned().collect(),
+                mutation_sequence: entry.last_mutation_sequence,
+            })
+        })
+    }
+
+    fn make_final_gate_reminder(entry: &VerificationLedgerEntry) -> VerificationReport {
+        let status = entry
+            .last_final_status
+            .unwrap_or(VerificationStatus::Failed);
+        VerificationReport {
+            report_id: format!(
+                "vr-reminder-{}",
+                entry.project_root
+                    .display()
+                    .to_string()
+                    .chars()
+                    .map(|ch| match ch {
+                        '\\' | '/' | ':' | ' ' => '-',
+                        other => other,
+                    })
+                    .collect::<String>()
+            ),
+            phase: VerificationPhase::Final,
+            adapter_id: entry.adapter_id.clone(),
+            project_root: entry.project_root.clone(),
+            touched_paths: entry.touched_paths.iter().cloned().collect(),
+            status,
+            summary_text: format!(
+                "[verifier:final:{}] {} ({})\n[verifier] final verification is still failing for the current workspace state; make another edit before concluding",
+                entry.adapter_id,
+                status.as_str(),
+                entry.project_root.display()
+            ),
+            steps: Vec::new(),
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     pub fn run_turn(
         &mut self,
@@ -345,8 +460,13 @@ where
 
         let mut assistant_messages = Vec::new();
         let mut tool_results = Vec::new();
+        let mut verification_reports = Vec::new();
+        let mut verification_gate = VerificationGateStatus::not_required();
         let mut prompt_cache_events = Vec::new();
         let mut iterations = 0;
+        let mut mutation_sequence = 0_u64;
+        let mut verification_ledger =
+            BTreeMap::<VerificationLedgerKey, VerificationLedgerEntry>::new();
 
         loop {
             iterations += 1;
@@ -403,7 +523,78 @@ where
             assistant_messages.push(assistant_message);
 
             if pending_tool_uses.is_empty() {
-                break;
+                let Some(verifier) = self.verifier.as_ref() else {
+                    break;
+                };
+                if !verifier.final_gate_enabled() {
+                    break;
+                }
+
+                let mut gate_reports = Vec::new();
+                let pending_final_gate_keys = verification_ledger
+                    .iter()
+                    .filter_map(|(key, entry)| {
+                        if entry.last_final_verified_sequence == Some(entry.last_mutation_sequence)
+                        {
+                            if entry
+                                .last_final_status
+                                .is_some_and(VerificationStatus::is_success)
+                            {
+                                None
+                            } else {
+                                Some((key.clone(), false))
+                            }
+                        } else {
+                            Some((key.clone(), true))
+                        }
+                    })
+                    .collect::<Vec<_>>();
+
+                if pending_final_gate_keys.is_empty() {
+                    break;
+                }
+
+                verification_gate.attempted = true;
+                verification_gate.passed = false;
+
+                for (key, should_run) in pending_final_gate_keys {
+                    let Some(entry) = verification_ledger.get(&key).cloned() else {
+                        continue;
+                    };
+                    let report = if should_run {
+                        let Some(report) = self.run_final_verification(&entry) else {
+                            continue;
+                        };
+                        if let Some(ledger_entry) = verification_ledger.get_mut(&key) {
+                            ledger_entry.last_final_status = Some(report.status);
+                            ledger_entry.last_final_verified_sequence =
+                                Some(ledger_entry.last_mutation_sequence);
+                        }
+                        report
+                    } else {
+                        Self::make_final_gate_reminder(&entry)
+                    };
+                    self.record_verifier_ran(
+                        iterations,
+                        &format!("final_gate:{}", entry.adapter_id),
+                        report.is_success(),
+                    );
+                    verification_gate.report_ids.push(report.report_id.clone());
+                    self.persist_verification_report(&report)?;
+                    gate_reports.push(report);
+                }
+
+                if gate_reports.is_empty() {
+                    break;
+                }
+
+                let gate_passed = gate_reports.iter().all(VerificationReport::is_success);
+                verification_gate.passed = gate_passed;
+                verification_reports.extend(gate_reports);
+                if gate_passed {
+                    break;
+                }
+                continue;
             }
 
             for (tool_use_id, tool_name, input) in pending_tool_uses {
@@ -453,6 +644,7 @@ where
                     )
                 };
 
+                let mut pending_verification_reports = Vec::new();
                 let result_message = match permission_outcome {
                     PermissionOutcome::Allow => {
                         self.record_tool_started(iterations, &tool_name);
@@ -491,16 +683,46 @@ where
                                 || post_hook_result.is_cancelled(),
                         );
 
-                        if !is_error {
-                            if let Some(verifier) = self.verifier.as_ref() {
-                                if let Some(result) = verifier.verify(&tool_name, &effective_input)
-                                {
-                                    self.record_verifier_ran(iterations, &tool_name, result.passed);
-                                    output = prepend_verifier_summary(&result.summary, output);
-                                    if !result.passed {
-                                        is_error = true;
-                                    }
+                        if !is_error && is_write_tool(&tool_name) {
+                            mutation_sequence += 1;
+                            let reports = self.run_quick_verification(
+                                &tool_name,
+                                &effective_input,
+                                mutation_sequence,
+                            );
+                            for report in reports {
+                                self.record_verifier_ran(
+                                    iterations,
+                                    &tool_name,
+                                    report.is_success(),
+                                );
+                                output = prepend_verifier_summary(&report.short_summary(), output);
+                                if !report.is_success() {
+                                    is_error = true;
                                 }
+                                let key = VerificationLedgerKey {
+                                    adapter_id: report.adapter_id.clone(),
+                                    project_root: report.project_root.clone(),
+                                };
+                                verification_ledger
+                                    .entry(key)
+                                    .and_modify(|entry| {
+                                        entry.update_from_report(&report, mutation_sequence);
+                                    })
+                                    .or_insert_with(|| VerificationLedgerEntry {
+                                        adapter_id: report.adapter_id.clone(),
+                                        project_root: report.project_root.clone(),
+                                        touched_paths: report
+                                            .touched_paths
+                                            .iter()
+                                            .cloned()
+                                            .collect(),
+                                        last_mutation_sequence: mutation_sequence,
+                                        last_quick_status: Some(report.status),
+                                        last_final_status: None,
+                                        last_final_verified_sequence: None,
+                                    });
+                                pending_verification_reports.push(report);
                             }
                         }
 
@@ -518,6 +740,10 @@ where
                     .map_err(|error| RuntimeError::new(error.to_string()))?;
                 self.record_tool_finished(iterations, &result_message);
                 tool_results.push(result_message);
+                for report in pending_verification_reports {
+                    self.persist_verification_report(&report)?;
+                    verification_reports.push(report);
+                }
             }
         }
 
@@ -526,6 +752,8 @@ where
         let summary = TurnSummary {
             assistant_messages,
             tool_results,
+            verification_reports,
+            verification_gate,
             prompt_cache_events,
             iterations,
             usage: self.usage_tracker.cumulative_usage(),
@@ -689,6 +917,18 @@ where
             Value::from(summary.tool_results.len() as u64),
         );
         attributes.insert(
+            "verification_reports".to_string(),
+            Value::from(summary.verification_reports.len() as u64),
+        );
+        attributes.insert(
+            "verification_gate_attempted".to_string(),
+            Value::Bool(summary.verification_gate.attempted),
+        );
+        attributes.insert(
+            "verification_gate_passed".to_string(),
+            Value::Bool(summary.verification_gate.passed),
+        );
+        attributes.insert(
             "prompt_cache_events".to_string(),
             Value::from(summary.prompt_cache_events.len() as u64),
         );
@@ -823,6 +1063,10 @@ fn merge_hook_feedback(messages: &[String], output: String, is_error: bool) -> S
     sections.join("\n\n")
 }
 
+fn is_write_tool(tool_name: &str) -> bool {
+    matches!(tool_name, "edit_file" | "write_file" | "Edit" | "Write")
+}
+
 type ToolHandler = Box<dyn FnMut(&str) -> Result<String, ToolError>>;
 
 /// Simple in-memory tool executor for tests and lightweight integrations.
@@ -872,7 +1116,10 @@ mod tests {
     use crate::prompt::{ProjectContext, SystemPromptBuilder};
     use crate::session::{ContentBlock, MessageRole, Session};
     use crate::usage::TokenUsage;
-    use crate::verifier::{VerificationResult, Verifier};
+    use crate::verifier::{
+        VerificationContext, VerificationPhase, VerificationReport, VerificationStatus,
+        VerificationTarget, Verifier,
+    };
     use crate::ToolError;
     use std::fs;
     use std::path::PathBuf;
@@ -1532,7 +1779,71 @@ mod tests {
 
     #[cfg(windows)]
     fn shell_snippet(script: &str) -> String {
-        script.replace('\'', "\"")
+        fn powershell_literal(value: &str) -> String {
+            format!("'{}'", value.replace('\'', "''"))
+        }
+
+        fn powershell_snippet(script: &str) -> String {
+            format!(
+                "powershell -NoProfile -EncodedCommand {}",
+                encode_powershell(script)
+            )
+        }
+
+        fn encode_powershell(script: &str) -> String {
+            let bytes: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
+            encode_base64(&bytes)
+        }
+
+        fn encode_base64(bytes: &[u8]) -> String {
+            const TABLE: &[u8; 64] =
+                b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
+
+            for chunk in bytes.chunks(3) {
+                let b0 = chunk[0];
+                let b1 = *chunk.get(1).unwrap_or(&0);
+                let b2 = *chunk.get(2).unwrap_or(&0);
+                let n = (u32::from(b0) << 16) | (u32::from(b1) << 8) | u32::from(b2);
+
+                encoded.push(TABLE[((n >> 18) & 0x3F) as usize] as char);
+                encoded.push(TABLE[((n >> 12) & 0x3F) as usize] as char);
+                encoded.push(if chunk.len() > 1 {
+                    TABLE[((n >> 6) & 0x3F) as usize] as char
+                } else {
+                    '='
+                });
+                encoded.push(if chunk.len() > 2 {
+                    TABLE[(n & 0x3F) as usize] as char
+                } else {
+                    '='
+                });
+            }
+
+            encoded
+        }
+
+        if let Some((text, exit_code)) = script
+            .strip_prefix("printf '")
+            .and_then(|rest| rest.split_once("'; exit "))
+        {
+            return powershell_snippet(&format!(
+                "[Console]::Out.Write({}); exit {exit_code}",
+                powershell_literal(text)
+            ));
+        }
+
+        if let Some(text) = script
+            .strip_prefix("printf '")
+            .and_then(|rest| rest.strip_suffix('\''))
+        {
+            return powershell_snippet(&format!(
+                "[Console]::Out.Write({})",
+                powershell_literal(text)
+            ));
+        }
+
+        panic!("unsupported windows conversation test snippet: {script}");
     }
 
     #[cfg(not(windows))]
@@ -1878,13 +2189,18 @@ mod tests {
 
         struct FailingVerifier;
         impl Verifier for FailingVerifier {
-            fn verify(&self, tool_name: &str, _tool_input: &str) -> Option<VerificationResult> {
-                assert_eq!(tool_name, "edit_file");
-                Some(VerificationResult {
-                    passed: false,
-                    summary: "[verifier] cargo check: FAIL\nerror[E0308]: mismatched types"
-                        .to_string(),
-                })
+            fn quick_verify(&self, context: &VerificationContext) -> Vec<VerificationReport> {
+                assert_eq!(context.tool_name, "edit_file");
+                vec![test_verification_report(
+                    VerificationPhase::Quick,
+                    VerificationStatus::Failed,
+                    &context.touched_paths,
+                    "[verifier:quick:rust-cargo] failed (/workspace)\n[verifier] cargo check: FAIL\nerror[E0308]: mismatched types",
+                )]
+            }
+
+            fn final_verify(&self, _target: &VerificationTarget) -> Option<VerificationReport> {
+                None
             }
         }
 
@@ -1910,13 +2226,25 @@ mod tests {
         };
         assert!(*is_error, "verifier failure should flip is_error to true");
         assert!(
-            output.contains("[verifier]") && output.contains("mismatched types"),
-            "verifier summary must be surfaced to the model: {output:?}"
+            output.contains("[verifier:quick:rust-cargo] failed"),
+            "verifier short summary must be surfaced to the model: {output:?}"
         );
         assert!(
             output.contains("edited"),
             "original tool output must be preserved: {output:?}"
         );
+        assert_eq!(summary.verification_reports.len(), 1);
+        assert!(
+            summary.verification_reports[0]
+                .summary_text
+                .contains("mismatched types"),
+            "full verifier report should retain diagnostics"
+        );
+        assert!(runtime
+            .session()
+            .messages
+            .iter()
+            .any(|message| message.role == MessageRole::Verification));
     }
 
     #[test]
@@ -1950,11 +2278,17 @@ mod tests {
 
         struct PassingVerifier;
         impl Verifier for PassingVerifier {
-            fn verify(&self, _tool_name: &str, _tool_input: &str) -> Option<VerificationResult> {
-                Some(VerificationResult {
-                    passed: true,
-                    summary: "[verifier] cargo check: ok".to_string(),
-                })
+            fn quick_verify(&self, context: &VerificationContext) -> Vec<VerificationReport> {
+                vec![test_verification_report(
+                    VerificationPhase::Quick,
+                    VerificationStatus::Passed,
+                    &context.touched_paths,
+                    "[verifier:quick:rust-cargo] passed (/workspace)\n[verifier] cargo check: ok",
+                )]
+            }
+
+            fn final_verify(&self, _target: &VerificationTarget) -> Option<VerificationReport> {
+                None
             }
         }
 
@@ -1978,7 +2312,9 @@ mod tests {
             panic!("expected tool result");
         };
         assert!(!*is_error, "passing verifier must not flip is_error");
-        assert!(output.contains("cargo check: ok"));
+        assert!(output.contains("[verifier:quick:rust-cargo] passed"));
+        assert_eq!(summary.verification_reports.len(), 1);
+        assert!(summary.verification_reports[0].is_success());
     }
 
     #[test]
@@ -2014,12 +2350,18 @@ mod tests {
         use std::sync::Arc;
         struct CountingVerifier(Arc<AtomicUsize>);
         impl Verifier for CountingVerifier {
-            fn verify(&self, _tool_name: &str, _tool_input: &str) -> Option<VerificationResult> {
+            fn quick_verify(&self, _context: &VerificationContext) -> Vec<VerificationReport> {
                 self.0.fetch_add(1, Ordering::SeqCst);
-                Some(VerificationResult {
-                    passed: true,
-                    summary: String::new(),
-                })
+                vec![test_verification_report(
+                    VerificationPhase::Quick,
+                    VerificationStatus::Passed,
+                    &[PathBuf::from("src/lib.rs")],
+                    "[verifier:quick:rust-cargo] passed (/workspace)",
+                )]
+            }
+
+            fn final_verify(&self, _target: &VerificationTarget) -> Option<VerificationReport> {
+                None
             }
         }
 
@@ -2043,5 +2385,252 @@ mod tests {
             0,
             "verifier must be skipped when tool itself errored"
         );
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[test]
+    fn staged_final_gate_blocks_completion_until_validation_passes() {
+        struct StagedApi {
+            calls: usize,
+        }
+
+        impl ApiClient for StagedApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.calls += 1;
+                match self.calls {
+                    1 => Ok(vec![
+                        AssistantEvent::ToolUse {
+                            id: "tool-1".to_string(),
+                            name: "edit_file".to_string(),
+                            input: r#"{"file_path":"src/lib.rs"}"#.to_string(),
+                        },
+                        AssistantEvent::MessageStop,
+                    ]),
+                    2 => Ok(vec![
+                        AssistantEvent::TextDelta("done".to_string()),
+                        AssistantEvent::MessageStop,
+                    ]),
+                    3 => Ok(vec![
+                        AssistantEvent::ToolUse {
+                            id: "tool-2".to_string(),
+                            name: "edit_file".to_string(),
+                            input: r#"{"file_path":"src/lib.rs"}"#.to_string(),
+                        },
+                        AssistantEvent::MessageStop,
+                    ]),
+                    4 => Ok(vec![
+                        AssistantEvent::TextDelta("done for real".to_string()),
+                        AssistantEvent::MessageStop,
+                    ]),
+                    _ => unreachable!("extra API call"),
+                }
+            }
+        }
+
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        struct StagedVerifier {
+            final_calls: Arc<AtomicUsize>,
+        }
+
+        impl Verifier for StagedVerifier {
+            fn quick_verify(&self, context: &VerificationContext) -> Vec<VerificationReport> {
+                vec![test_verification_report(
+                    VerificationPhase::Quick,
+                    VerificationStatus::Passed,
+                    &context.touched_paths,
+                    "[verifier:quick:rust-cargo] passed (/workspace)\n[verifier] cargo check: ok",
+                )]
+            }
+
+            fn final_verify(&self, target: &VerificationTarget) -> Option<VerificationReport> {
+                let call = self.final_calls.fetch_add(1, Ordering::SeqCst);
+                let status = if call == 0 {
+                    VerificationStatus::Failed
+                } else {
+                    VerificationStatus::Passed
+                };
+                Some(test_verification_report(
+                    VerificationPhase::Final,
+                    status,
+                    &target.touched_paths,
+                    if status == VerificationStatus::Failed {
+                        "[verifier:final:rust-cargo] failed (/workspace)\n[verifier] cargo test: FAIL"
+                    } else {
+                        "[verifier:final:rust-cargo] passed (/workspace)\n[verifier] cargo test: ok"
+                    },
+                ))
+            }
+
+            fn final_gate_enabled(&self) -> bool {
+                true
+            }
+        }
+
+        let final_calls = Arc::new(AtomicUsize::new(0));
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            StagedApi { calls: 0 },
+            StaticToolExecutor::new().register("edit_file", |_| Ok("edited".to_string())),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_verifier(Box::new(StagedVerifier {
+            final_calls: final_calls.clone(),
+        }));
+
+        let summary = runtime
+            .run_turn("fix and verify", None)
+            .expect("turn should complete");
+
+        assert_eq!(summary.iterations, 4);
+        assert_eq!(summary.tool_results.len(), 2);
+        assert!(summary.verification_gate.attempted);
+        assert!(summary.verification_gate.passed);
+        assert_eq!(final_calls.load(Ordering::SeqCst), 2);
+        assert!(summary
+            .verification_reports
+            .iter()
+            .any(|report| report.phase == VerificationPhase::Final
+                && report.status == VerificationStatus::Failed));
+        assert!(summary
+            .assistant_messages
+            .last()
+            .is_some_and(|message| message.blocks.iter().any(
+                |block| matches!(block, ContentBlock::Text { text } if text == "done for real")
+            )));
+    }
+
+    #[test]
+    fn staged_final_gate_dedupes_retries_without_new_mutation() {
+        struct ReminderApi {
+            calls: usize,
+        }
+
+        impl ApiClient for ReminderApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.calls += 1;
+                match self.calls {
+                    1 => Ok(vec![
+                        AssistantEvent::ToolUse {
+                            id: "tool-1".to_string(),
+                            name: "edit_file".to_string(),
+                            input: r#"{"file_path":"src/lib.rs"}"#.to_string(),
+                        },
+                        AssistantEvent::MessageStop,
+                    ]),
+                    2 | 3 => Ok(vec![
+                        AssistantEvent::TextDelta("done".to_string()),
+                        AssistantEvent::MessageStop,
+                    ]),
+                    4 => Ok(vec![
+                        AssistantEvent::ToolUse {
+                            id: "tool-2".to_string(),
+                            name: "edit_file".to_string(),
+                            input: r#"{"file_path":"src/lib.rs"}"#.to_string(),
+                        },
+                        AssistantEvent::MessageStop,
+                    ]),
+                    5 => Ok(vec![
+                        AssistantEvent::TextDelta("done now".to_string()),
+                        AssistantEvent::MessageStop,
+                    ]),
+                    _ => unreachable!("extra API call"),
+                }
+            }
+        }
+
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        struct ReminderVerifier {
+            final_calls: Arc<AtomicUsize>,
+        }
+
+        impl Verifier for ReminderVerifier {
+            fn quick_verify(&self, context: &VerificationContext) -> Vec<VerificationReport> {
+                vec![test_verification_report(
+                    VerificationPhase::Quick,
+                    VerificationStatus::Passed,
+                    &context.touched_paths,
+                    "[verifier:quick:rust-cargo] passed (/workspace)\n[verifier] cargo check: ok",
+                )]
+            }
+
+            fn final_verify(&self, target: &VerificationTarget) -> Option<VerificationReport> {
+                let call = self.final_calls.fetch_add(1, Ordering::SeqCst);
+                let status = if call == 0 {
+                    VerificationStatus::Failed
+                } else {
+                    VerificationStatus::Passed
+                };
+                Some(test_verification_report(
+                    VerificationPhase::Final,
+                    status,
+                    &target.touched_paths,
+                    if status == VerificationStatus::Failed {
+                        "[verifier:final:rust-cargo] failed (/workspace)\n[verifier] cargo clippy: FAIL"
+                    } else {
+                        "[verifier:final:rust-cargo] passed (/workspace)\n[verifier] cargo clippy: ok"
+                    },
+                ))
+            }
+
+            fn final_gate_enabled(&self) -> bool {
+                true
+            }
+        }
+
+        let final_calls = Arc::new(AtomicUsize::new(0));
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            ReminderApi { calls: 0 },
+            StaticToolExecutor::new().register("edit_file", |_| Ok("edited".to_string())),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_verifier(Box::new(ReminderVerifier {
+            final_calls: final_calls.clone(),
+        }));
+
+        let summary = runtime
+            .run_turn("fix and verify", None)
+            .expect("turn should complete");
+
+        assert_eq!(summary.iterations, 5);
+        assert_eq!(final_calls.load(Ordering::SeqCst), 2);
+        assert!(summary
+            .verification_reports
+            .iter()
+            .any(|report| report.phase == VerificationPhase::Final
+                && report.steps.is_empty()
+                && report.summary_text.contains("still failing")));
+        assert!(summary.verification_gate.attempted);
+        assert!(summary.verification_gate.passed);
+    }
+
+    fn test_verification_report(
+        phase: VerificationPhase,
+        status: VerificationStatus,
+        touched_paths: &[PathBuf],
+        summary_text: &str,
+    ) -> VerificationReport {
+        VerificationReport {
+            report_id: format!("test-{}-{}", phase.as_str(), status.as_str()),
+            phase,
+            adapter_id: "rust-cargo".to_string(),
+            project_root: PathBuf::from("/workspace"),
+            touched_paths: touched_paths.to_vec(),
+            status,
+            summary_text: summary_text.to_string(),
+            steps: Vec::new(),
+        }
     }
 }

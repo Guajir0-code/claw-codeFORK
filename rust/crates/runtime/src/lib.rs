@@ -63,7 +63,7 @@ pub use config::{
     McpServerConfig, McpStdioServerConfig, McpTransport, McpWebSocketServerConfig, OAuthConfig,
     ProviderFallbackConfig, ResolvedPermissionMode, RuntimeConfig, RuntimeFeatureConfig,
     RuntimeHookConfig, RuntimePermissionRuleConfig, RuntimePluginConfig, RuntimeVerifierConfig,
-    ScopedMcpServerConfig, CLAW_SETTINGS_SCHEMA_NAME,
+    RuntimeVerifierMode, ScopedMcpServerConfig, CLAW_SETTINGS_SCHEMA_NAME,
 };
 pub use config_validate::{
     check_unsupported_format, format_diagnostics, validate_config_file, ConfigDiagnostic,
@@ -169,7 +169,9 @@ pub use usage::{
     format_usd, pricing_for_model, ModelPricing, TokenUsage, UsageCostEstimate, UsageTracker,
 };
 pub use verifier::{
-    prepend_verifier_summary, CargoVerifier, CargoVerifierConfig, VerificationResult, Verifier,
+    prepend_verifier_summary, CargoVerifier, CargoVerifierConfig, VerificationContext,
+    VerificationFailureKind, VerificationGateStatus, VerificationPhase, VerificationReport,
+    VerificationStatus, Verifier,
 };
 pub use worker_boot::{
     Worker, WorkerEvent, WorkerEventKind, WorkerEventPayload, WorkerFailure, WorkerFailureKind,

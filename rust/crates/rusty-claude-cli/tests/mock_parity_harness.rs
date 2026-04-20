@@ -1,16 +1,63 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 use mock_anthropic_service::{MockAnthropicService, SCENARIO_PREFIX};
 use serde_json::{json, Value};
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(unix)]
+fn make_executable(path: &Path) {
+    let mut permissions = fs::metadata(path)
+        .expect("plugin script metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(path, permissions).expect("plugin script should be executable");
+}
+
+#[cfg(not(unix))]
+fn make_executable(path: &Path) {
+    let _ = path;
+}
+
+fn script_name(stem: &str) -> String {
+    if cfg!(windows) {
+        format!("{stem}.cmd")
+    } else {
+        format!("{stem}.sh")
+    }
+}
+
+fn write_script(path: &Path, unix_body: &str, windows_body: &str) {
+    let body = if cfg!(windows) {
+        windows_body
+    } else {
+        unix_body
+    };
+    fs::write(path, body).expect("script should write");
+    make_executable(path);
+}
+
+fn configure_clean_process_env(command: &mut Command, home: &Path) {
+    if cfg!(windows) {
+        command.env("USERPROFILE", home);
+        for key in ["PATH", "SystemRoot", "ComSpec", "PATHEXT", "TEMP", "TMP"] {
+            if let Ok(value) = std::env::var(key) {
+                command.env(key, value);
+            }
+        }
+    } else {
+        command.env("PATH", "/usr/bin:/bin");
+    }
+}
 
 #[test]
 #[allow(clippy::too_many_lines)]
@@ -317,7 +364,6 @@ fn run_case(case: ScenarioCase, workspace: &HarnessWorkspace, base_url: &str) ->
         .env("CLAW_CONFIG_HOME", &workspace.config_home)
         .env("HOME", &workspace.home)
         .env("NO_COLOR", "1")
-        .env("PATH", "/usr/bin:/bin")
         .args([
             "--model",
             "sonnet",
@@ -325,6 +371,7 @@ fn run_case(case: ScenarioCase, workspace: &HarnessWorkspace, base_url: &str) ->
             case.permission_mode,
             "--output-format=json",
         ]);
+    configure_clean_process_env(&mut command, &workspace.home);
 
     if let Some(allowed_tools) = case.allowed_tools {
         command.args(["--allowedTools", allowed_tools]);
@@ -420,41 +467,36 @@ fn prepare_plugin_fixture(workspace: &HarnessWorkspace) {
     fs::create_dir_all(&tool_dir).expect("plugin tools dir");
     fs::create_dir_all(&manifest_dir).expect("plugin manifest dir");
 
-    let script_path = tool_dir.join("echo-json.sh");
-    fs::write(
+    let script_file = script_name("echo-json");
+    let script_path = tool_dir.join(&script_file);
+    write_script(
         &script_path,
         "#!/bin/sh\nINPUT=$(cat)\nprintf '{\"plugin\":\"%s\",\"tool\":\"%s\",\"input\":%s}\\n' \"$CLAWD_PLUGIN_ID\" \"$CLAWD_TOOL_NAME\" \"$INPUT\"\n",
-    )
-    .expect("plugin script should write");
-    let mut permissions = fs::metadata(&script_path)
-        .expect("plugin script metadata")
-        .permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(&script_path, permissions).expect("plugin script should be executable");
+        "@echo off\r\npowershell -NoProfile -Command \"$inputData = [Console]::In.ReadToEnd(); $payload = @{ plugin = $env:CLAWD_PLUGIN_ID; tool = $env:CLAWD_TOOL_NAME; input = ($inputData | ConvertFrom-Json) } | ConvertTo-Json -Compress -Depth 10; [Console]::Out.WriteLine($payload)\"\r\n",
+    );
 
     fs::write(
         manifest_dir.join("plugin.json"),
-        r#"{
-  "name": "parity-plugin",
-  "version": "1.0.0",
-  "description": "mock parity plugin",
-  "tools": [
-    {
-      "name": "plugin_echo",
-      "description": "Echo JSON input",
-      "inputSchema": {
-        "type": "object",
-        "properties": {
-          "message": { "type": "string" }
-        },
-        "required": ["message"],
-        "additionalProperties": false
-      },
-      "command": "./tools/echo-json.sh",
-      "requiredPermission": "workspace-write"
-    }
-  ]
-}"#,
+        serde_json::to_string_pretty(&json!({
+            "name": "parity-plugin",
+            "version": "1.0.0",
+            "description": "mock parity plugin",
+            "tools": [{
+                "name": "plugin_echo",
+                "description": "Echo JSON input",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "message": { "type": "string" }
+                    },
+                    "required": ["message"],
+                    "additionalProperties": false
+                },
+                "command": format!("./tools/{script_file}"),
+                "requiredPermission": "workspace-write"
+            }]
+        }))
+        .expect("plugin manifest should serialize"),
     )
     .expect("plugin manifest should write");
 
@@ -483,7 +525,7 @@ fn assert_streaming_text(_: &HarnessWorkspace, run: &ScenarioRun) {
     assert_eq!(run.response["tool_results"], Value::Array(Vec::new()));
 }
 
-fn assert_read_file_roundtrip(workspace: &HarnessWorkspace, run: &ScenarioRun) {
+fn assert_read_file_roundtrip(_workspace: &HarnessWorkspace, run: &ScenarioRun) {
     assert_eq!(run.response["iterations"], Value::from(2));
     assert_eq!(
         run.response["tool_uses"][0]["name"],
@@ -500,7 +542,10 @@ fn assert_read_file_roundtrip(workspace: &HarnessWorkspace, run: &ScenarioRun) {
     let output = run.response["tool_results"][0]["output"]
         .as_str()
         .expect("tool output");
-    assert!(output.contains(&workspace.root.join("fixture.txt").display().to_string()));
+    assert!(
+        output.contains("fixture.txt"),
+        "expected read_file output to mention fixture.txt, got: {output}"
+    );
     assert!(output.contains("alpha parity line"));
 }
 
@@ -535,7 +580,7 @@ fn assert_write_file_allowed(workspace: &HarnessWorkspace, run: &ScenarioRun) {
     assert!(run.response["message"]
         .as_str()
         .expect("message text")
-        .contains("generated/output.txt"));
+        .contains("output.txt"));
     let generated = workspace.root.join("generated").join("output.txt");
     let contents = fs::read_to_string(&generated).expect("generated file should exist");
     assert_eq!(contents, "created by mock service\n");

@@ -209,7 +209,31 @@ const VERIFIER_FIELDS: &[FieldSpec] = &[
         expected: FieldType::Bool,
     },
     FieldSpec {
+        name: "mode",
+        expected: FieldType::String,
+    },
+    FieldSpec {
+        name: "quickOnWrite",
+        expected: FieldType::Bool,
+    },
+    FieldSpec {
+        name: "finalGate",
+        expected: FieldType::Bool,
+    },
+    FieldSpec {
+        name: "maxOutputBytes",
+        expected: FieldType::Number,
+    },
+    FieldSpec {
         name: "cargo",
+        expected: FieldType::Object,
+    },
+    FieldSpec {
+        name: "node",
+        expected: FieldType::Object,
+    },
+    FieldSpec {
+        name: "python",
         expected: FieldType::Object,
     },
 ];
@@ -229,6 +253,28 @@ const VERIFIER_CARGO_FIELDS: &[FieldSpec] = &[
     },
     FieldSpec {
         name: "test",
+        expected: FieldType::Bool,
+    },
+    FieldSpec {
+        name: "timeoutSecs",
+        expected: FieldType::Number,
+    },
+];
+
+const VERIFIER_NODE_FIELDS: &[FieldSpec] = &[
+    FieldSpec {
+        name: "enabled",
+        expected: FieldType::Bool,
+    },
+    FieldSpec {
+        name: "timeoutSecs",
+        expected: FieldType::Number,
+    },
+];
+
+const VERIFIER_PYTHON_FIELDS: &[FieldSpec] = &[
+    FieldSpec {
+        name: "enabled",
         expected: FieldType::Bool,
     },
     FieldSpec {
@@ -552,6 +598,24 @@ pub fn validate_config_file(
                 cargo,
                 VERIFIER_CARGO_FIELDS,
                 "verifier.cargo",
+                source,
+                &path_display,
+            ));
+        }
+        if let Some(node) = verifier.get("node").and_then(JsonValue::as_object) {
+            result.merge(validate_object_keys(
+                node,
+                VERIFIER_NODE_FIELDS,
+                "verifier.node",
+                source,
+                &path_display,
+            ));
+        }
+        if let Some(python) = verifier.get("python").and_then(JsonValue::as_object) {
+            result.merge(validate_object_keys(
+                python,
+                VERIFIER_PYTHON_FIELDS,
+                "verifier.python",
                 source,
                 &path_display,
             ));

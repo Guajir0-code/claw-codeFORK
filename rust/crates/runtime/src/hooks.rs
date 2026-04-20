@@ -737,7 +737,7 @@ fn format_hook_failure(command: &str, code: i32, stdout: Option<&str>, stderr: &
 
 fn shell_command(command: &str) -> CommandWithStdin {
     #[cfg(windows)]
-    let mut command_builder = {
+    let command_builder = {
         let mut command_builder = Command::new("cmd");
         command_builder.arg("/C").arg(command);
         CommandWithStdin::new(command_builder)
@@ -957,11 +957,10 @@ mod tests {
     #[test]
     fn executes_hooks_in_configured_order() {
         // given
+        let first_command = shell_snippet("printf 'first'");
+        let second_command = shell_snippet("printf 'second'");
         let runner = HookRunner::new(RuntimeHookConfig::new(
-            vec![
-                shell_snippet("printf 'first'"),
-                shell_snippet("printf 'second'"),
-            ],
+            vec![first_command.clone(), second_command.clone()],
             Vec::new(),
             Vec::new(),
         ));
@@ -987,7 +986,7 @@ mod tests {
                 event: HookEvent::PreToolUse,
                 command,
                 ..
-            } if command == "printf 'first'"
+            } if command == &first_command
         ));
         assert!(matches!(
             &reporter.events[1],
@@ -995,7 +994,7 @@ mod tests {
                 event: HookEvent::PreToolUse,
                 command,
                 ..
-            } if command == "printf 'first'"
+            } if command == &first_command
         ));
         assert!(matches!(
             &reporter.events[2],
@@ -1003,7 +1002,7 @@ mod tests {
                 event: HookEvent::PreToolUse,
                 command,
                 ..
-            } if command == "printf 'second'"
+            } if command == &second_command
         ));
         assert!(matches!(
             &reporter.events[3],
@@ -1011,7 +1010,7 @@ mod tests {
                 event: HookEvent::PreToolUse,
                 command,
                 ..
-            } if command == "printf 'second'"
+            } if command == &second_command
         ));
     }
 
@@ -1041,10 +1040,10 @@ mod tests {
 
     #[test]
     fn malformed_nonempty_hook_output_reports_explicit_diagnostic_with_previews() {
+        let command =
+            shell_snippet("printf '{not-json\nsecond line'; printf 'stderr warning' >&2; exit 1");
         let runner = HookRunner::new(RuntimeHookConfig::new(
-            vec![shell_snippet(
-                "printf '{not-json\nsecond line'; printf 'stderr warning' >&2; exit 1",
-            )],
+            vec![command.clone()],
             Vec::new(),
             Vec::new(),
         ));
@@ -1056,8 +1055,11 @@ mod tests {
         assert!(rendered.contains("hook_invalid_json:"));
         assert!(rendered.contains("phase=PreToolUse"));
         assert!(rendered.contains("tool=Edit"));
-        assert!(rendered.contains("command=printf '{not-json"));
-        assert!(rendered.contains("printf 'stderr warning' >&2; exit 1"));
+        assert!(rendered.contains("command="));
+        assert!(rendered.contains("stderr warning"));
+        assert!(rendered.contains(
+            &super::bounded_hook_preview(&command).unwrap_or_else(|| "<empty>".to_string())
+        ));
         assert!(rendered.contains("detail=key must be a string"));
         assert!(rendered.contains("stdout_preview={not-json"));
         assert!(rendered.contains("second line stderr_preview=stderr warning"));
@@ -1106,7 +1108,87 @@ mod tests {
 
     #[cfg(windows)]
     fn shell_snippet(script: &str) -> String {
-        script.replace('\'', "\"")
+        fn powershell_literal(value: &str) -> String {
+            format!("'{}'", value.replace('\'', "''"))
+        }
+
+        fn powershell_snippet(script: &str) -> String {
+            format!(
+                "powershell -NoProfile -EncodedCommand {}",
+                encode_powershell(script)
+            )
+        }
+
+        fn encode_powershell(script: &str) -> String {
+            let bytes: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
+            encode_base64(&bytes)
+        }
+
+        fn encode_base64(bytes: &[u8]) -> String {
+            const TABLE: &[u8; 64] =
+                b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
+
+            for chunk in bytes.chunks(3) {
+                let b0 = chunk[0];
+                let b1 = *chunk.get(1).unwrap_or(&0);
+                let b2 = *chunk.get(2).unwrap_or(&0);
+                let n = (u32::from(b0) << 16) | (u32::from(b1) << 8) | u32::from(b2);
+
+                encoded.push(TABLE[((n >> 18) & 0x3F) as usize] as char);
+                encoded.push(TABLE[((n >> 12) & 0x3F) as usize] as char);
+                encoded.push(if chunk.len() > 1 {
+                    TABLE[((n >> 6) & 0x3F) as usize] as char
+                } else {
+                    '='
+                });
+                encoded.push(if chunk.len() > 2 {
+                    TABLE[(n & 0x3F) as usize] as char
+                } else {
+                    '='
+                });
+            }
+
+            encoded
+        }
+
+        if let Some(seconds) = script.strip_prefix("sleep ") {
+            return powershell_snippet(&format!("Start-Sleep -Seconds {seconds}"));
+        }
+
+        if script == "printf '{not-json\nsecond line'; printf 'stderr warning' >&2; exit 1" {
+            return powershell_snippet(
+                "[Console]::Out.Write('{not-json' + [Environment]::NewLine + 'second line'); \
+[Console]::Error.Write('stderr warning'); exit 1",
+            );
+        }
+
+        if let Some(rest) = script.strip_prefix("printf '%s' '") {
+            if let Some(text) = rest.strip_suffix('\'') {
+                return powershell_snippet(&format!(
+                    "[Console]::Out.Write({})",
+                    powershell_literal(text)
+                ));
+            }
+        }
+
+        if let Some(rest) = script.strip_prefix("printf '") {
+            if let Some((text, exit_code)) = rest.split_once("'; exit ") {
+                return powershell_snippet(&format!(
+                    "[Console]::Out.Write({}); exit {exit_code}",
+                    powershell_literal(text)
+                ));
+            }
+
+            if let Some(text) = rest.strip_suffix('\'') {
+                return powershell_snippet(&format!(
+                    "[Console]::Out.Write({})",
+                    powershell_literal(text)
+                ));
+            }
+        }
+
+        panic!("unsupported windows hook test snippet: {script}");
     }
 
     #[cfg(not(windows))]
