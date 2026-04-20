@@ -14,6 +14,7 @@ use crate::permissions::{
 };
 use crate::session::{ContentBlock, ConversationMessage, Session};
 use crate::usage::{TokenUsage, UsageTracker};
+use crate::verifier::{prepend_verifier_summary, Verifier};
 
 const DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD: u32 = 100_000;
 const AUTO_COMPACTION_THRESHOLD_ENV_VAR: &str = "CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS";
@@ -136,6 +137,7 @@ pub struct ConversationRuntime<C, T> {
     hook_abort_signal: HookAbortSignal,
     hook_progress_reporter: Option<Box<dyn HookProgressReporter>>,
     session_tracer: Option<SessionTracer>,
+    verifier: Option<Box<dyn Verifier>>,
 }
 
 impl<C, T> ConversationRuntime<C, T>
@@ -185,6 +187,7 @@ where
             hook_abort_signal: HookAbortSignal::default(),
             hook_progress_reporter: None,
             session_tracer: None,
+            verifier: None,
         }
     }
 
@@ -218,6 +221,12 @@ where
     #[must_use]
     pub fn with_session_tracer(mut self, session_tracer: SessionTracer) -> Self {
         self.session_tracer = Some(session_tracer);
+        self
+    }
+
+    #[must_use]
+    pub fn with_verifier(mut self, verifier: Box<dyn Verifier>) -> Self {
+        self.verifier = Some(verifier);
         self
     }
 
@@ -482,6 +491,19 @@ where
                                 || post_hook_result.is_cancelled(),
                         );
 
+                        if !is_error {
+                            if let Some(verifier) = self.verifier.as_ref() {
+                                if let Some(result) = verifier.verify(&tool_name, &effective_input)
+                                {
+                                    self.record_verifier_ran(iterations, &tool_name, result.passed);
+                                    output = prepend_verifier_summary(&result.summary, output);
+                                    if !result.passed {
+                                        is_error = true;
+                                    }
+                                }
+                            }
+                        }
+
                         ConversationMessage::tool_result(tool_use_id, tool_name, output, is_error)
                     }
                     PermissionOutcome::Deny { reason } => ConversationMessage::tool_result(
@@ -673,6 +695,21 @@ where
         session_tracer.record("turn_completed", attributes);
     }
 
+    fn record_verifier_ran(&self, iteration: usize, tool_name: &str, passed: bool) {
+        let Some(session_tracer) = &self.session_tracer else {
+            return;
+        };
+
+        let mut attributes = Map::new();
+        attributes.insert("iteration".to_string(), Value::from(iteration as u64));
+        attributes.insert(
+            "tool_name".to_string(),
+            Value::String(tool_name.to_string()),
+        );
+        attributes.insert("passed".to_string(), Value::Bool(passed));
+        session_tracer.record("verifier_ran", attributes);
+    }
+
     fn record_turn_failed(&self, iteration: usize, error: &RuntimeError) {
         let Some(session_tracer) = &self.session_tracer else {
             return;
@@ -835,6 +872,7 @@ mod tests {
     use crate::prompt::{ProjectContext, SystemPromptBuilder};
     use crate::session::{ContentBlock, MessageRole, Session};
     use crate::usage::TokenUsage;
+    use crate::verifier::{VerificationResult, Verifier};
     use crate::ToolError;
     use std::fs;
     use std::path::PathBuf;
@@ -1807,5 +1845,203 @@ mod tests {
 
         // then
         assert_eq!(error.to_string(), "upstream failed");
+    }
+
+    #[test]
+    fn verifier_feedback_is_injected_and_marks_tool_result_as_error_on_failure() {
+        struct EditOnceApi {
+            calls: usize,
+        }
+        impl ApiClient for EditOnceApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.calls += 1;
+                if self.calls == 1 {
+                    Ok(vec![
+                        AssistantEvent::ToolUse {
+                            id: "tool-1".to_string(),
+                            name: "edit_file".to_string(),
+                            input: r#"{"file_path":"src/lib.rs"}"#.to_string(),
+                        },
+                        AssistantEvent::MessageStop,
+                    ])
+                } else {
+                    Ok(vec![
+                        AssistantEvent::TextDelta("ok".to_string()),
+                        AssistantEvent::MessageStop,
+                    ])
+                }
+            }
+        }
+
+        struct FailingVerifier;
+        impl Verifier for FailingVerifier {
+            fn verify(&self, tool_name: &str, _tool_input: &str) -> Option<VerificationResult> {
+                assert_eq!(tool_name, "edit_file");
+                Some(VerificationResult {
+                    passed: false,
+                    summary: "[verifier] cargo check: FAIL\nerror[E0308]: mismatched types"
+                        .to_string(),
+                })
+            }
+        }
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            EditOnceApi { calls: 0 },
+            StaticToolExecutor::new().register("edit_file", |_| Ok("edited".to_string())),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_verifier(Box::new(FailingVerifier));
+
+        let summary = runtime
+            .run_turn("fix it", None)
+            .expect("turn should complete");
+
+        assert_eq!(summary.tool_results.len(), 1);
+        let ContentBlock::ToolResult {
+            is_error, output, ..
+        } = &summary.tool_results[0].blocks[0]
+        else {
+            panic!("expected tool result block");
+        };
+        assert!(*is_error, "verifier failure should flip is_error to true");
+        assert!(
+            output.contains("[verifier]") && output.contains("mismatched types"),
+            "verifier summary must be surfaced to the model: {output:?}"
+        );
+        assert!(
+            output.contains("edited"),
+            "original tool output must be preserved: {output:?}"
+        );
+    }
+
+    #[test]
+    fn verifier_passing_leaves_tool_result_successful() {
+        struct EditApi {
+            done: bool,
+        }
+        impl ApiClient for EditApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                if self.done {
+                    Ok(vec![
+                        AssistantEvent::TextDelta("done".to_string()),
+                        AssistantEvent::MessageStop,
+                    ])
+                } else {
+                    self.done = true;
+                    Ok(vec![
+                        AssistantEvent::ToolUse {
+                            id: "tool-1".to_string(),
+                            name: "edit_file".to_string(),
+                            input: r#"{"file_path":"src/lib.rs"}"#.to_string(),
+                        },
+                        AssistantEvent::MessageStop,
+                    ])
+                }
+            }
+        }
+
+        struct PassingVerifier;
+        impl Verifier for PassingVerifier {
+            fn verify(&self, _tool_name: &str, _tool_input: &str) -> Option<VerificationResult> {
+                Some(VerificationResult {
+                    passed: true,
+                    summary: "[verifier] cargo check: ok".to_string(),
+                })
+            }
+        }
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            EditApi { done: false },
+            StaticToolExecutor::new().register("edit_file", |_| Ok("edited".to_string())),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_verifier(Box::new(PassingVerifier));
+
+        let summary = runtime
+            .run_turn("edit", None)
+            .expect("turn should complete");
+
+        let ContentBlock::ToolResult {
+            is_error, output, ..
+        } = &summary.tool_results[0].blocks[0]
+        else {
+            panic!("expected tool result");
+        };
+        assert!(!*is_error, "passing verifier must not flip is_error");
+        assert!(output.contains("cargo check: ok"));
+    }
+
+    #[test]
+    fn verifier_is_not_called_when_tool_result_is_already_an_error() {
+        struct EditApi {
+            done: bool,
+        }
+        impl ApiClient for EditApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                if self.done {
+                    Ok(vec![
+                        AssistantEvent::TextDelta("ack".to_string()),
+                        AssistantEvent::MessageStop,
+                    ])
+                } else {
+                    self.done = true;
+                    Ok(vec![
+                        AssistantEvent::ToolUse {
+                            id: "tool-1".to_string(),
+                            name: "edit_file".to_string(),
+                            input: r#"{"file_path":"src/lib.rs"}"#.to_string(),
+                        },
+                        AssistantEvent::MessageStop,
+                    ])
+                }
+            }
+        }
+
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        struct CountingVerifier(Arc<AtomicUsize>);
+        impl Verifier for CountingVerifier {
+            fn verify(&self, _tool_name: &str, _tool_input: &str) -> Option<VerificationResult> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Some(VerificationResult {
+                    passed: true,
+                    summary: String::new(),
+                })
+            }
+        }
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            EditApi { done: false },
+            StaticToolExecutor::new()
+                .register("edit_file", |_| Err(ToolError::new("tool exploded"))),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_verifier(Box::new(CountingVerifier(counter.clone())));
+
+        runtime
+            .run_turn("edit", None)
+            .expect("turn should complete");
+
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            0,
+            "verifier must be skipped when tool itself errored"
+        );
     }
 }

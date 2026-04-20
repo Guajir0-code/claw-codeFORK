@@ -65,6 +65,68 @@ pub struct RuntimeFeatureConfig {
     sandbox: SandboxConfig,
     provider_fallbacks: ProviderFallbackConfig,
     trusted_roots: Vec<String>,
+    verifier: RuntimeVerifierConfig,
+}
+
+/// Settings for the post-edit self-verification loop.
+///
+/// When enabled, the runtime runs cargo-based checks on the crate owning a
+/// freshly edited Rust file and injects the result into the tool output so
+/// the assistant can react on the next iteration.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeVerifierConfig {
+    enabled: bool,
+    run_check: bool,
+    run_clippy: bool,
+    run_fmt: bool,
+    run_test: bool,
+    timeout_secs: u64,
+}
+
+impl Default for RuntimeVerifierConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            run_check: true,
+            run_clippy: true,
+            run_fmt: true,
+            run_test: true,
+            timeout_secs: 120,
+        }
+    }
+}
+
+impl RuntimeVerifierConfig {
+    #[must_use]
+    pub fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    #[must_use]
+    pub fn run_check(&self) -> bool {
+        self.run_check
+    }
+
+    #[must_use]
+    pub fn run_clippy(&self) -> bool {
+        self.run_clippy
+    }
+
+    #[must_use]
+    pub fn run_fmt(&self) -> bool {
+        self.run_fmt
+    }
+
+    #[must_use]
+    pub fn run_test(&self) -> bool {
+        self.run_test
+    }
+
+    #[must_use]
+    pub fn timeout_secs(&self) -> u64 {
+        self.timeout_secs
+    }
 }
 
 /// Ordered chain of fallback model identifiers used when the primary
@@ -315,6 +377,7 @@ impl ConfigLoader {
             sandbox: parse_optional_sandbox_config(&merged_value)?,
             provider_fallbacks: parse_optional_provider_fallbacks(&merged_value)?,
             trusted_roots: parse_optional_trusted_roots(&merged_value)?,
+            verifier: parse_optional_verifier_config(&merged_value)?,
         };
 
         Ok(RuntimeConfig {
@@ -414,6 +477,11 @@ impl RuntimeConfig {
     pub fn trusted_roots(&self) -> &[String] {
         &self.feature_config.trusted_roots
     }
+
+    #[must_use]
+    pub fn verifier(&self) -> &RuntimeVerifierConfig {
+        &self.feature_config.verifier
+    }
 }
 
 impl RuntimeFeatureConfig {
@@ -482,6 +550,17 @@ impl RuntimeFeatureConfig {
     #[must_use]
     pub fn trusted_roots(&self) -> &[String] {
         &self.trusted_roots
+    }
+
+    #[must_use]
+    pub fn verifier(&self) -> &RuntimeVerifierConfig {
+        &self.verifier
+    }
+
+    #[must_use]
+    pub fn with_verifier(mut self, verifier: RuntimeVerifierConfig) -> Self {
+        self.verifier = verifier;
+        self
     }
 }
 
@@ -775,6 +854,40 @@ fn validate_optional_hooks_config(
     path: &Path,
 ) -> Result<(), ConfigError> {
     parse_optional_hooks_config_object(root, &format!("{}: hooks", path.display())).map(|_| ())
+}
+
+fn parse_optional_verifier_config(root: &JsonValue) -> Result<RuntimeVerifierConfig, ConfigError> {
+    let Some(object) = root.as_object() else {
+        return Ok(RuntimeVerifierConfig::default());
+    };
+    let Some(verifier_value) = object.get("verifier") else {
+        return Ok(RuntimeVerifierConfig::default());
+    };
+    let verifier = expect_object(verifier_value, "merged settings.verifier")?;
+
+    let mut config = RuntimeVerifierConfig::default();
+    if let Some(enabled) = optional_bool(verifier, "enabled", "merged settings.verifier")? {
+        config.enabled = enabled;
+    }
+    if let Some(cargo_value) = verifier.get("cargo") {
+        let cargo = expect_object(cargo_value, "merged settings.verifier.cargo")?;
+        if let Some(v) = optional_bool(cargo, "check", "merged settings.verifier.cargo")? {
+            config.run_check = v;
+        }
+        if let Some(v) = optional_bool(cargo, "clippy", "merged settings.verifier.cargo")? {
+            config.run_clippy = v;
+        }
+        if let Some(v) = optional_bool(cargo, "fmt", "merged settings.verifier.cargo")? {
+            config.run_fmt = v;
+        }
+        if let Some(v) = optional_bool(cargo, "test", "merged settings.verifier.cargo")? {
+            config.run_test = v;
+        }
+        if let Some(v) = optional_u64(cargo, "timeoutSecs", "merged settings.verifier.cargo")? {
+            config.timeout_secs = v;
+        }
+    }
+    Ok(config)
 }
 
 fn parse_optional_permission_rules(

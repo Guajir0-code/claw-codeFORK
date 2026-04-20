@@ -197,6 +197,44 @@ const TOP_LEVEL_FIELDS: &[FieldSpec] = &[
         name: "trustedRoots",
         expected: FieldType::StringArray,
     },
+    FieldSpec {
+        name: "verifier",
+        expected: FieldType::Object,
+    },
+];
+
+const VERIFIER_FIELDS: &[FieldSpec] = &[
+    FieldSpec {
+        name: "enabled",
+        expected: FieldType::Bool,
+    },
+    FieldSpec {
+        name: "cargo",
+        expected: FieldType::Object,
+    },
+];
+
+const VERIFIER_CARGO_FIELDS: &[FieldSpec] = &[
+    FieldSpec {
+        name: "check",
+        expected: FieldType::Bool,
+    },
+    FieldSpec {
+        name: "clippy",
+        expected: FieldType::Bool,
+    },
+    FieldSpec {
+        name: "fmt",
+        expected: FieldType::Bool,
+    },
+    FieldSpec {
+        name: "test",
+        expected: FieldType::Bool,
+    },
+    FieldSpec {
+        name: "timeoutSecs",
+        expected: FieldType::Number,
+    },
 ];
 
 const HOOKS_FIELDS: &[FieldSpec] = &[
@@ -500,6 +538,24 @@ pub fn validate_config_file(
             source,
             &path_display,
         ));
+    }
+    if let Some(verifier) = object.get("verifier").and_then(JsonValue::as_object) {
+        result.merge(validate_object_keys(
+            verifier,
+            VERIFIER_FIELDS,
+            "verifier",
+            source,
+            &path_display,
+        ));
+        if let Some(cargo) = verifier.get("cargo").and_then(JsonValue::as_object) {
+            result.merge(validate_object_keys(
+                cargo,
+                VERIFIER_CARGO_FIELDS,
+                "verifier.cargo",
+                source,
+                &path_display,
+            ));
+        }
     }
 
     result

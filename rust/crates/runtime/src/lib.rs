@@ -47,6 +47,7 @@ pub mod team_cron_registry;
 #[cfg(test)]
 mod trust_resolver;
 mod usage;
+pub mod verifier;
 pub mod worker_boot;
 
 pub use bash::{execute_bash, BashCommandInput, BashCommandOutput};
@@ -61,8 +62,8 @@ pub use config::{
     McpManagedProxyServerConfig, McpOAuthConfig, McpRemoteServerConfig, McpSdkServerConfig,
     McpServerConfig, McpStdioServerConfig, McpTransport, McpWebSocketServerConfig, OAuthConfig,
     ProviderFallbackConfig, ResolvedPermissionMode, RuntimeConfig, RuntimeFeatureConfig,
-    RuntimeHookConfig, RuntimePermissionRuleConfig, RuntimePluginConfig, ScopedMcpServerConfig,
-    CLAW_SETTINGS_SCHEMA_NAME,
+    RuntimeHookConfig, RuntimePermissionRuleConfig, RuntimePluginConfig, RuntimeVerifierConfig,
+    ScopedMcpServerConfig, CLAW_SETTINGS_SCHEMA_NAME,
 };
 pub use config_validate::{
     check_unsupported_format, format_diagnostics, validate_config_file, ConfigDiagnostic,
@@ -166,6 +167,9 @@ pub use task_packet::{validate_packet, TaskPacket, TaskPacketValidationError, Va
 pub use trust_resolver::{TrustConfig, TrustDecision, TrustEvent, TrustPolicy, TrustResolver};
 pub use usage::{
     format_usd, pricing_for_model, ModelPricing, TokenUsage, UsageCostEstimate, UsageTracker,
+};
+pub use verifier::{
+    prepend_verifier_summary, CargoVerifier, CargoVerifierConfig, VerificationResult, Verifier,
 };
 pub use worker_boot::{
     Worker, WorkerEvent, WorkerEventKind, WorkerEventPayload, WorkerFailure, WorkerFailureKind,
