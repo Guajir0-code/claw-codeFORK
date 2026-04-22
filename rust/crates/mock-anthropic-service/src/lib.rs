@@ -100,6 +100,13 @@ enum Scenario {
     PluginToolRoundtrip,
     AutoCompactTriggered,
     TokenCostReporting,
+    RustRedGreen,
+    NodeRedGreen,
+    PythonRedGreen,
+    RustConfigFailure,
+    NodeToolUnavailable,
+    PythonTimeout,
+    RustFinalGateRetry,
 }
 
 impl Scenario {
@@ -117,6 +124,13 @@ impl Scenario {
             "plugin_tool_roundtrip" => Some(Self::PluginToolRoundtrip),
             "auto_compact_triggered" => Some(Self::AutoCompactTriggered),
             "token_cost_reporting" => Some(Self::TokenCostReporting),
+            "rust_red_green" => Some(Self::RustRedGreen),
+            "node_red_green" => Some(Self::NodeRedGreen),
+            "python_red_green" => Some(Self::PythonRedGreen),
+            "rust_config_failure" => Some(Self::RustConfigFailure),
+            "node_tool_unavailable" => Some(Self::NodeToolUnavailable),
+            "python_timeout" => Some(Self::PythonTimeout),
+            "rust_final_gate_retry" => Some(Self::RustFinalGateRetry),
             _ => None,
         }
     }
@@ -135,6 +149,13 @@ impl Scenario {
             Self::PluginToolRoundtrip => "plugin_tool_roundtrip",
             Self::AutoCompactTriggered => "auto_compact_triggered",
             Self::TokenCostReporting => "token_cost_reporting",
+            Self::RustRedGreen => "rust_red_green",
+            Self::NodeRedGreen => "node_red_green",
+            Self::PythonRedGreen => "python_red_green",
+            Self::RustConfigFailure => "rust_config_failure",
+            Self::NodeToolUnavailable => "node_tool_unavailable",
+            Self::PythonTimeout => "python_timeout",
+            Self::RustFinalGateRetry => "rust_final_gate_retry",
         }
     }
 }
@@ -296,6 +317,200 @@ fn tool_results_by_name(request: &MessageRequest) -> HashMap<String, (String, bo
     results
 }
 
+fn tool_result_count(request: &MessageRequest) -> usize {
+    request
+        .messages
+        .iter()
+        .map(|message| {
+            message
+                .content
+                .iter()
+                .filter(|block| matches!(block, InputContentBlock::ToolResult { .. }))
+                .count()
+        })
+        .sum()
+}
+
+fn all_text_content(request: &MessageRequest) -> String {
+    request
+        .messages
+        .iter()
+        .flat_map(|message| message.content.iter())
+        .filter_map(|block| match block {
+            InputContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn count_text_occurrences(request: &MessageRequest, needle: &str) -> usize {
+    all_text_content(request).matches(needle).count()
+}
+
+enum QualityAction {
+    FinalText(String),
+    ToolUse {
+        message_id: &'static str,
+        tool_id: &'static str,
+        tool_name: &'static str,
+        input: Value,
+    },
+}
+
+impl QualityAction {
+    fn stream_body(self) -> String {
+        match self {
+            Self::FinalText(text) => final_text_sse(&text),
+            Self::ToolUse {
+                tool_id,
+                tool_name,
+                input,
+                ..
+            } => tool_use_sse_json(tool_id, tool_name, &input),
+        }
+    }
+
+    fn message_response(self) -> MessageResponse {
+        match self {
+            Self::FinalText(text) => text_message_response("msg_quality_final", &text),
+            Self::ToolUse {
+                message_id,
+                tool_id,
+                tool_name,
+                input,
+            } => tool_message_response(message_id, tool_id, tool_name, input),
+        }
+    }
+}
+
+fn write_file_input(path: &str, content: &str) -> Value {
+    json!({
+        "path": path,
+        "content": content,
+    })
+}
+
+#[allow(clippy::too_many_lines)]
+fn quality_action(request: &MessageRequest, scenario: Scenario) -> Option<QualityAction> {
+    let writes = tool_result_count(request);
+    let reminder_count = count_text_occurrences(request, "still failing");
+    match scenario {
+        Scenario::RustRedGreen => Some(match writes {
+            0 => QualityAction::ToolUse {
+                message_id: "msg_rust_red_green_broken",
+                tool_id: "toolu_rust_red_green_broken",
+                tool_name: "write_file",
+                input: write_file_input(
+                    "crates/app/src/lib.rs",
+                    "pub fn answer() -> usize {\n    \"wrong\"\n}\n",
+                ),
+            },
+            1 => QualityAction::ToolUse {
+                message_id: "msg_rust_red_green_fixed",
+                tool_id: "toolu_rust_red_green_fixed",
+                tool_name: "write_file",
+                input: write_file_input(
+                    "crates/app/src/lib.rs",
+                    "pub fn answer() -> usize {\n    42\n}\n",
+                ),
+            },
+            _ => QualityAction::FinalText("rust quality red-green complete".to_string()),
+        }),
+        Scenario::NodeRedGreen => Some(match writes {
+            0 => QualityAction::ToolUse {
+                message_id: "msg_node_red_green_broken",
+                tool_id: "toolu_node_red_green_broken",
+                tool_name: "write_file",
+                input: write_file_input(
+                    "packages/web/src/index.ts",
+                    "export const message: string = 42; // BROKEN_TYPECHECK\n",
+                ),
+            },
+            1 => QualityAction::ToolUse {
+                message_id: "msg_node_red_green_fixed",
+                tool_id: "toolu_node_red_green_fixed",
+                tool_name: "write_file",
+                input: write_file_input(
+                    "packages/web/src/index.ts",
+                    "export const message: string = \"ok\";\n",
+                ),
+            },
+            _ => QualityAction::FinalText("node quality red-green complete".to_string()),
+        }),
+        Scenario::PythonRedGreen => Some(match writes {
+            0 => QualityAction::ToolUse {
+                message_id: "msg_python_red_green_broken",
+                tool_id: "toolu_python_red_green_broken",
+                tool_name: "write_file",
+                input: write_file_input("services/api/app/main.py", "# BROKEN_PY_COMPILE\n"),
+            },
+            1 => QualityAction::ToolUse {
+                message_id: "msg_python_red_green_fixed",
+                tool_id: "toolu_python_red_green_fixed",
+                tool_name: "write_file",
+                input: write_file_input(
+                    "services/api/app/main.py",
+                    "def meaning() -> int:\n    return 42\n",
+                ),
+            },
+            _ => QualityAction::FinalText("python quality red-green complete".to_string()),
+        }),
+        Scenario::RustConfigFailure => Some(match writes {
+            0 => QualityAction::ToolUse {
+                message_id: "msg_rust_config_failure",
+                tool_id: "toolu_rust_config_failure",
+                tool_name: "write_file",
+                input: write_file_input("Cargo.toml", "[package\nname = \"broken\"\n"),
+            },
+            _ => QualityAction::FinalText("rust config failure captured".to_string()),
+        }),
+        Scenario::NodeToolUnavailable => Some(match writes {
+            0 => QualityAction::ToolUse {
+                message_id: "msg_node_tool_unavailable",
+                tool_id: "toolu_node_tool_unavailable",
+                tool_name: "write_file",
+                input: write_file_input(
+                    "packages/web/src/index.ts",
+                    "export const message = \"TOOL_UNAVAILABLE_SENTINEL\";\n",
+                ),
+            },
+            _ => QualityAction::FinalText("node tool unavailable captured".to_string()),
+        }),
+        Scenario::PythonTimeout => Some(match writes {
+            0 => QualityAction::ToolUse {
+                message_id: "msg_python_timeout",
+                tool_id: "toolu_python_timeout",
+                tool_name: "write_file",
+                input: write_file_input("services/api/app/main.py", "# TIMEOUT_SENTINEL\n"),
+            },
+            _ => QualityAction::FinalText("python timeout captured".to_string()),
+        }),
+        Scenario::RustFinalGateRetry => Some(match writes {
+            0 => QualityAction::ToolUse {
+                message_id: "msg_rust_final_gate_retry_broken",
+                tool_id: "toolu_rust_final_gate_retry_broken",
+                tool_name: "write_file",
+                input: write_file_input("crates/app/src/lib.rs", "pub fn answer()->usize{2}\n"),
+            },
+            1 if reminder_count > 0 => QualityAction::ToolUse {
+                message_id: "msg_rust_final_gate_retry_fixed",
+                tool_id: "toolu_rust_final_gate_retry_fixed",
+                tool_name: "write_file",
+                input: write_file_input(
+                    "crates/app/src/lib.rs",
+                    "pub fn answer() -> usize {\n    2\n}\n",
+                ),
+            },
+            1 => {
+                QualityAction::FinalText("attempting to conclude the current rust fix".to_string())
+            }
+            _ => QualityAction::FinalText("rust final gate retry complete".to_string()),
+        }),
+        _ => None,
+    }
+}
+
 fn flatten_tool_result_content(content: &[api::ToolResultContentBlock]) -> String {
     content
         .iter()
@@ -331,6 +546,9 @@ fn build_http_response(request: &MessageRequest, scenario: Scenario) -> String {
 
 #[allow(clippy::too_many_lines)]
 fn build_stream_body(request: &MessageRequest, scenario: Scenario) -> String {
+    if let Some(action) = quality_action(request, scenario) {
+        return action.stream_body();
+    }
     match scenario {
         Scenario::StreamingText => streaming_text_sse(),
         Scenario::ReadFileRoundtrip => match latest_tool_result(request) {
@@ -464,11 +682,21 @@ fn build_stream_body(request: &MessageRequest, scenario: Scenario) -> String {
         Scenario::TokenCostReporting => {
             final_text_sse_with_usage("token cost reporting parity complete.", 1_000, 500)
         }
+        Scenario::RustRedGreen
+        | Scenario::NodeRedGreen
+        | Scenario::PythonRedGreen
+        | Scenario::RustConfigFailure
+        | Scenario::NodeToolUnavailable
+        | Scenario::PythonTimeout
+        | Scenario::RustFinalGateRetry => unreachable!("quality scenarios are handled above"),
     }
 }
 
 #[allow(clippy::too_many_lines)]
 fn build_message_response(request: &MessageRequest, scenario: Scenario) -> MessageResponse {
+    if let Some(action) = quality_action(request, scenario) {
+        return action.message_response();
+    }
     match scenario {
         Scenario::StreamingText => text_message_response(
             "msg_streaming_text",
@@ -634,6 +862,13 @@ fn build_message_response(request: &MessageRequest, scenario: Scenario) -> Messa
             1_000,
             500,
         ),
+        Scenario::RustRedGreen
+        | Scenario::NodeRedGreen
+        | Scenario::PythonRedGreen
+        | Scenario::RustConfigFailure
+        | Scenario::NodeToolUnavailable
+        | Scenario::PythonTimeout
+        | Scenario::RustFinalGateRetry => unreachable!("quality scenarios are handled above"),
     }
 }
 
@@ -651,6 +886,13 @@ fn request_id_for(scenario: Scenario) -> &'static str {
         Scenario::PluginToolRoundtrip => "req_plugin_tool_roundtrip",
         Scenario::AutoCompactTriggered => "req_auto_compact_triggered",
         Scenario::TokenCostReporting => "req_token_cost_reporting",
+        Scenario::RustRedGreen => "req_rust_red_green",
+        Scenario::NodeRedGreen => "req_node_red_green",
+        Scenario::PythonRedGreen => "req_python_red_green",
+        Scenario::RustConfigFailure => "req_rust_config_failure",
+        Scenario::NodeToolUnavailable => "req_node_tool_unavailable",
+        Scenario::PythonTimeout => "req_python_timeout",
+        Scenario::RustFinalGateRetry => "req_rust_final_gate_retry",
     }
 }
 
@@ -834,6 +1076,72 @@ fn tool_use_sse(tool_id: &str, tool_name: &str, partial_json_chunks: &[&str]) ->
         tool_name,
         partial_json_chunks,
     }])
+}
+
+fn tool_use_sse_json(tool_id: &str, tool_name: &str, input: &Value) -> String {
+    let mut body = String::new();
+    append_sse(
+        &mut body,
+        "message_start",
+        json!({
+            "type": "message_start",
+            "message": {
+                "id": format!("msg_{tool_id}"),
+                "type": "message",
+                "role": "assistant",
+                "content": [],
+                "model": DEFAULT_MODEL,
+                "stop_reason": null,
+                "stop_sequence": null,
+                "usage": usage_json(12, 0)
+            }
+        }),
+    );
+    append_sse(
+        &mut body,
+        "content_block_start",
+        json!({
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {
+                "type": "tool_use",
+                "id": tool_id,
+                "name": tool_name,
+                "input": {}
+            }
+        }),
+    );
+    append_sse(
+        &mut body,
+        "content_block_delta",
+        json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+                "type": "input_json_delta",
+                "partial_json": input.to_string()
+            }
+        }),
+    );
+    append_sse(
+        &mut body,
+        "content_block_stop",
+        json!({
+            "type": "content_block_stop",
+            "index": 0
+        }),
+    );
+    append_sse(
+        &mut body,
+        "message_delta",
+        json!({
+            "type": "message_delta",
+            "delta": {"stop_reason": "tool_use", "stop_sequence": null},
+            "usage": usage_json(12, 4)
+        }),
+    );
+    append_sse(&mut body, "message_stop", json!({"type": "message_stop"}));
+    body
 }
 
 struct ToolUseSse<'a> {

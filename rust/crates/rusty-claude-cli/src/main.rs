@@ -10,7 +10,7 @@ mod init;
 mod input;
 mod render;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
@@ -53,7 +53,8 @@ use runtime::{
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use tools::{
-    execute_tool, mvp_tool_specs, GlobalToolRegistry, RuntimeToolDefinition, ToolSearchOutput,
+    execute_tool, mvp_tool_specs, run_inline_review, GlobalToolRegistry, ReviewFinding,
+    ReviewOutcome, RuntimeToolDefinition, ToolSearchOutput,
 };
 
 const DEFAULT_MODEL: &str = "claude-opus-4-6";
@@ -83,6 +84,10 @@ const OFFICIAL_REPO_SLUG: &str = "ultraworkers/claw-code";
 const DEPRECATED_INSTALL_COMMAND: &str = "cargo install claw-code";
 const LATEST_SESSION_REFERENCE: &str = "latest";
 const SESSION_REFERENCE_ALIASES: &[&str] = &[LATEST_SESSION_REFERENCE, "last", "recent"];
+const CRITIC_CHANGED_FILES_THRESHOLD: usize = 4;
+const CRITIC_CHANGED_LINES_THRESHOLD: usize = 200;
+const AUTO_SKILL_MIN_ITERATIONS: usize = 3;
+const AUTO_SKILL_MIN_FAILURES: usize = 2;
 const CLI_OPTION_SUGGESTIONS: &[&str] = &[
     "--help",
     "-h",
@@ -3160,6 +3165,8 @@ struct LiveCli {
     runtime: BuiltRuntime,
     session: SessionHandle,
     prompt_history: Vec<PromptHistoryEntry>,
+    critic_planner: runtime::critic::CriticPlanner,
+    turn_mutation_counter: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -3671,6 +3678,8 @@ impl LiveCli {
             runtime,
             session,
             prompt_history: Vec::new(),
+            critic_planner: runtime::critic::CriticPlanner::new(),
+            turn_mutation_counter: 0,
         };
         cli.persist_session()?;
         Ok(cli)
@@ -3779,6 +3788,8 @@ impl LiveCli {
         hook_abort_monitor.stop();
         match result {
             Ok(summary) => {
+                let summary =
+                    self.apply_post_turn_pipeline(&mut runtime, summary, &mut permission_prompter)?;
                 let should_print_buffered = runtime.buffer_output;
                 self.replace_runtime(runtime)?;
                 spinner.finish(
@@ -3829,7 +3840,8 @@ impl LiveCli {
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
         let result = runtime.run_turn(input, Some(&mut permission_prompter));
         hook_abort_monitor.stop();
-        let summary = result?;
+        let summary =
+            self.apply_post_turn_pipeline(&mut runtime, result?, &mut permission_prompter)?;
         self.replace_runtime(runtime)?;
         self.persist_session()?;
         let final_text = final_assistant_text(&summary);
@@ -3842,7 +3854,8 @@ impl LiveCli {
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
         let result = runtime.run_turn(input, Some(&mut permission_prompter));
         hook_abort_monitor.stop();
-        let summary = result?;
+        let summary =
+            self.apply_post_turn_pipeline(&mut runtime, result?, &mut permission_prompter)?;
         self.replace_runtime(runtime)?;
         self.persist_session()?;
         println!(
@@ -3879,6 +3892,54 @@ impl LiveCli {
             })
         );
         Ok(())
+    }
+
+    fn apply_post_turn_pipeline(
+        &mut self,
+        runtime: &mut BuiltRuntime,
+        mut summary: runtime::TurnSummary,
+        permission_prompter: &mut CliPermissionPrompter,
+    ) -> Result<runtime::TurnSummary, Box<dyn std::error::Error>> {
+        let change_stats = collect_turn_change_stats(&summary);
+
+        self.turn_mutation_counter += 1;
+        let planner_stats = runtime::critic::DiffStats {
+            files_changed: change_stats.files.len(),
+            lines_changed: change_stats.total_changed_lines,
+            distinct_roots: change_stats.verified_roots.len(),
+        };
+        let subagent_depth = std::env::var("CLAUDE_CODE_SUBAGENT_DEPTH")
+            .ok()
+            .and_then(|value| value.trim().parse::<u32>().ok())
+            .unwrap_or(0);
+        let planner_decision =
+            self.critic_planner
+                .plan(self.turn_mutation_counter, subagent_depth, planner_stats);
+        let planner_allows = matches!(
+            planner_decision,
+            runtime::critic::CriticDecision::Run { .. }
+        );
+
+        if planner_allows && should_run_critic(&summary, &change_stats) {
+            let review = run_inline_review(
+                &build_critic_prompt(&summary, &change_stats),
+                Some(&critic_model_for(&self.model)),
+            )
+            .map_err(std::io::Error::other)?;
+            let blocking = blocking_findings(&review.findings);
+            if blocking.is_empty() {
+                append_review_note(&mut summary, &review);
+            } else {
+                let fix_summary = runtime.run_turn(
+                    build_critic_fix_prompt(&blocking),
+                    Some(permission_prompter),
+                )?;
+                summary = merge_turn_summaries(summary, fix_summary);
+            }
+        }
+
+        let _ = maybe_write_auto_skill_draft(&summary);
+        Ok(summary)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -5960,6 +6021,7 @@ fn render_export_text(session: &Session) -> String {
                     phase,
                     status,
                     summary_text,
+                    ..
                 } => lines.push(format!(
                     "[verification_report id={report_id} phase={} status={}] {summary_text}",
                     phase.as_str(),
@@ -6173,6 +6235,7 @@ fn render_session_markdown(session: &Session, session_id: &str, session_path: &P
                     phase,
                     status,
                     summary_text,
+                    ..
                 } => {
                     lines.push(format!(
                         "**Verification** `{}` _(id `{report_id}`, status `{}`)_",
@@ -6711,6 +6774,7 @@ fn build_runtime_with_plugin_state(
     if verifier_config.enabled() {
         let cargo_config = runtime::CargoVerifierConfig {
             legacy_mode: !verifier_config.staged(),
+            auto_mode: verifier_config.auto(),
             quick_on_write: verifier_config.quick_on_write(),
             final_gate: verifier_config.final_gate(),
             max_output_bytes: verifier_config.max_output_bytes(),
@@ -7256,6 +7320,604 @@ fn final_assistant_text(summary: &runtime::TurnSummary) -> String {
         .unwrap_or_default()
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct FileChangeStats {
+    path: String,
+    added_lines: usize,
+    deleted_lines: usize,
+    preview_lines: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct TurnChangeStats {
+    files: Vec<FileChangeStats>,
+    total_changed_lines: usize,
+    verified_roots: BTreeSet<String>,
+}
+
+fn collect_turn_change_stats(summary: &runtime::TurnSummary) -> TurnChangeStats {
+    let mut files = BTreeMap::<String, FileChangeStats>::new();
+    for message in &summary.tool_results {
+        for block in &message.blocks {
+            let ContentBlock::ToolResult {
+                tool_name,
+                output,
+                is_error,
+                ..
+            } = block
+            else {
+                continue;
+            };
+            if *is_error
+                || !matches!(
+                    tool_name.as_str(),
+                    "write_file" | "edit_file" | "Write" | "Edit"
+                )
+            {
+                continue;
+            }
+            let Ok(parsed) = serde_json::from_str::<Value>(output) else {
+                continue;
+            };
+            let Some(path) = parsed
+                .get("filePath")
+                .or_else(|| parsed.get("file_path"))
+                .and_then(Value::as_str)
+            else {
+                continue;
+            };
+
+            let entry = files
+                .entry(path.to_string())
+                .or_insert_with(|| FileChangeStats {
+                    path: path.to_string(),
+                    ..FileChangeStats::default()
+                });
+            if let Some(hunks) = parsed.get("structuredPatch").and_then(Value::as_array) {
+                for hunk in hunks {
+                    if let Some(lines) = hunk.get("lines").and_then(Value::as_array) {
+                        for line in lines.iter().filter_map(Value::as_str) {
+                            if line.starts_with('+') {
+                                entry.added_lines += 1;
+                            } else if line.starts_with('-') {
+                                entry.deleted_lines += 1;
+                            }
+                            if entry.preview_lines.len() < 8 {
+                                entry.preview_lines.push(line.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let verified_roots = summary
+        .verification_reports
+        .iter()
+        .map(|report| report.project_root.display().to_string())
+        .filter(|root| !root.is_empty())
+        .collect::<BTreeSet<_>>();
+    let files = files.into_values().collect::<Vec<_>>();
+    let total_changed_lines = files
+        .iter()
+        .map(|file| file.added_lines + file.deleted_lines)
+        .sum();
+
+    TurnChangeStats {
+        files,
+        total_changed_lines,
+        verified_roots,
+    }
+}
+
+fn should_run_critic(summary: &runtime::TurnSummary, stats: &TurnChangeStats) -> bool {
+    let critic_enabled = env::var("CLAUDE_CODE_CRITIC").map_or(true, |value| value.trim() != "0");
+    critic_enabled
+        && summary.verification_gate.passed
+        && (stats.files.len() >= CRITIC_CHANGED_FILES_THRESHOLD
+            || stats.total_changed_lines >= CRITIC_CHANGED_LINES_THRESHOLD
+            || stats.verified_roots.len() > 1)
+}
+
+fn build_critic_prompt(summary: &runtime::TurnSummary, stats: &TurnChangeStats) -> String {
+    let mut lines = vec![
+        "Review the recent code change.".to_string(),
+        "Return ONLY JSON with this exact shape:".to_string(),
+        r#"{"summary":"short summary","findings":[{"severity":"P0|P1|P2|P3","title":"short title","body":"one paragraph","file":"optional path"}]}"#.to_string(),
+        "Report only concrete bugs, regressions, security issues, or missing edge cases. If there are no real findings, return an empty findings array.".to_string(),
+        format!(
+            "Verification gate passed: {} (attempted: {}).",
+            summary.verification_gate.passed, summary.verification_gate.attempted
+        ),
+        format!(
+            "Changed files: {}. Total changed lines: {}. Verified roots: {}.",
+            stats.files.len(),
+            stats.total_changed_lines,
+            stats.verified_roots.len()
+        ),
+        String::new(),
+        "Diff summary:".to_string(),
+    ];
+
+    for file in &stats.files {
+        lines.push(format!(
+            "- {} (+{}, -{})",
+            file.path, file.added_lines, file.deleted_lines
+        ));
+        for preview in file.preview_lines.iter().take(4) {
+            lines.push(format!("  {preview}"));
+        }
+    }
+
+    if !summary.verification_reports.is_empty() {
+        lines.push(String::new());
+        lines.push("Verification summary:".to_string());
+        for report in summary.verification_reports.iter().rev().take(6) {
+            lines.push(format!(
+                "- {} {} {}",
+                report.adapter_id,
+                report.phase.as_str(),
+                report.summary_text
+            ));
+        }
+    }
+
+    let mut prompt = lines.join("\n");
+    if prompt.chars().count() > 6_000 {
+        prompt = prompt.chars().take(6_000).collect();
+    }
+    prompt
+}
+
+fn critic_model_for(current_model: &str) -> String {
+    env::var("CLAUDE_CODE_CRITIC_MODEL").unwrap_or_else(|_| current_model.to_string())
+}
+
+fn blocking_findings(findings: &[ReviewFinding]) -> Vec<ReviewFinding> {
+    findings
+        .iter()
+        .filter(|finding| matches!(finding.severity.as_str(), "P0" | "P1"))
+        .cloned()
+        .collect()
+}
+
+fn build_critic_fix_prompt(findings: &[ReviewFinding]) -> String {
+    let mut lines = vec![
+        "A post-change code review found blocking issues. Fix only the blocking findings below, preserve existing behavior unless the finding requires change, and rerun the minimal verification needed.".to_string(),
+        String::new(),
+        "Blocking findings:".to_string(),
+    ];
+    for finding in findings {
+        lines.push(format!(
+            "- {} {}{}",
+            finding.severity,
+            finding.title,
+            finding
+                .file
+                .as_deref()
+                .map(|file| format!(" ({file})"))
+                .unwrap_or_default()
+        ));
+        lines.push(format!("  {}", finding.body));
+    }
+    lines.join("\n")
+}
+
+fn append_review_note(summary: &mut runtime::TurnSummary, review: &ReviewOutcome) {
+    use std::fmt::Write as _;
+    if review.findings.is_empty() {
+        return;
+    }
+    let mut note = format!("\n\nReview notes: {}\n", review.summary);
+    for finding in &review.findings {
+        let file_suffix = finding
+            .file
+            .as_deref()
+            .map(|file| format!(" ({file})"))
+            .unwrap_or_default();
+        let _ = writeln!(
+            note,
+            "- {} {}{}: {}",
+            finding.severity, finding.title, file_suffix, finding.body
+        );
+    }
+
+    if let Some(message) = summary.assistant_messages.last_mut() {
+        message.blocks.push(ContentBlock::Text { text: note });
+    } else {
+        summary.assistant_messages.push(ConversationMessage {
+            role: MessageRole::Assistant,
+            blocks: vec![ContentBlock::Text { text: note }],
+            usage: None,
+        });
+    }
+}
+
+fn merge_turn_summaries(
+    mut initial: runtime::TurnSummary,
+    follow_up: runtime::TurnSummary,
+) -> runtime::TurnSummary {
+    initial
+        .assistant_messages
+        .extend(follow_up.assistant_messages);
+    initial.tool_results.extend(follow_up.tool_results);
+    initial
+        .verification_reports
+        .extend(follow_up.verification_reports);
+    initial.verification_gate = follow_up.verification_gate;
+    initial
+        .prompt_cache_events
+        .extend(follow_up.prompt_cache_events);
+    initial.iterations += follow_up.iterations;
+    initial.usage = TokenUsage {
+        input_tokens: initial.usage.input_tokens + follow_up.usage.input_tokens,
+        output_tokens: initial.usage.output_tokens + follow_up.usage.output_tokens,
+        cache_creation_input_tokens: initial.usage.cache_creation_input_tokens
+            + follow_up.usage.cache_creation_input_tokens,
+        cache_read_input_tokens: initial.usage.cache_read_input_tokens
+            + follow_up.usage.cache_read_input_tokens,
+    };
+    initial.auto_compaction = follow_up.auto_compaction.or(initial.auto_compaction);
+    initial
+}
+
+#[allow(clippy::too_many_lines)]
+fn maybe_write_auto_skill_draft(
+    summary: &runtime::TurnSummary,
+) -> Result<Option<PathBuf>, Box<dyn std::error::Error>> {
+    let enabled = env::var("CLAUDE_CODE_AUTO_SKILLS").is_ok_and(|value| value.trim() == "1");
+    if !enabled {
+        return Ok(None);
+    }
+
+    let first_green_index = summary
+        .verification_reports
+        .iter()
+        .position(|report| report.phase == runtime::VerificationPhase::Final && report.is_success())
+        .unwrap_or(summary.verification_reports.len());
+    let failures_before_green = summary
+        .verification_reports
+        .iter()
+        .take(first_green_index)
+        .filter(|report| !report.is_success())
+        .count();
+    if summary.iterations < AUTO_SKILL_MIN_ITERATIONS
+        || failures_before_green < AUTO_SKILL_MIN_FAILURES
+    {
+        return Ok(None);
+    }
+
+    let cwd = env::current_dir()?;
+    let mut root_counts = BTreeMap::<String, usize>::new();
+    for report in &summary.verification_reports {
+        let root = report.project_root.display().to_string();
+        if !root.is_empty() {
+            *root_counts.entry(root).or_default() += 1;
+        }
+    }
+    let Some((dominant_root, _)) = root_counts.into_iter().max_by_key(|(_, count)| *count) else {
+        return Ok(None);
+    };
+
+    let adapter_ids = summary
+        .verification_reports
+        .iter()
+        .map(|report| report.adapter_id.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let failure_kinds = summary
+        .verification_reports
+        .iter()
+        .filter_map(runtime::VerificationReport::primary_failure_kind)
+        .map(|kind| kind.as_str().to_string())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let touched_files = summary
+        .verification_reports
+        .iter()
+        .flat_map(|report| report.touched_paths.iter())
+        .filter_map(|path| path.strip_prefix(&cwd).ok().or(Some(path.as_path())))
+        .map(|path| sanitize_skill_text(&path.display().to_string()))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .take(12)
+        .collect::<Vec<_>>();
+
+    let root_name = Path::new(&dominant_root)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("workspace");
+    let adapter_slug = adapter_ids
+        .first()
+        .map(|adapter| slugify_token(adapter))
+        .filter(|slug| !slug.is_empty())
+        .unwrap_or_else(|| String::from("mixed"));
+    let skill_slug = format!("repair-{}-{}", slugify_token(root_name), adapter_slug);
+    let skill_dir = cwd
+        .join(".claude")
+        .join("skills")
+        .join("generated")
+        .join(&skill_slug);
+    if skill_dir.exists() {
+        return Ok(None);
+    }
+    fs::create_dir_all(&skill_dir)?;
+
+    let skill_name = format!("repair-{}-{}", sanitize_skill_text(root_name), adapter_slug);
+    let markdown = build_auto_skill_markdown(
+        &skill_name,
+        &adapter_ids,
+        &failure_kinds,
+        &touched_files,
+        failures_before_green,
+        summary.iterations,
+    );
+    fs::write(skill_dir.join("SKILL.md"), markdown)?;
+    fs::write(
+        skill_dir.join("meta.json"),
+        serde_json::to_string_pretty(&json!({
+            "status": "quarantined",
+            "confidence": "draft",
+            "requires_human_approval": true,
+            "promotion": {
+                "required_fixtures": 3,
+                "max_token_regression_pct": 10
+            },
+            "source_episode": {
+                "iterations": summary.iterations,
+                "failures_before_first_green": failures_before_green,
+                "adapters": adapter_ids,
+                "failure_kinds": failure_kinds,
+                "dominant_root": sanitize_skill_text(root_name),
+                "touched_files": touched_files
+            }
+        }))?,
+    )?;
+
+    Ok(Some(skill_dir))
+}
+
+fn build_auto_skill_markdown(
+    skill_name: &str,
+    adapter_ids: &[String],
+    failure_kinds: &[String],
+    touched_files: &[String],
+    failures_before_green: usize,
+    iterations: usize,
+) -> String {
+    let lines = vec![
+        "---".to_string(),
+        format!("name: {skill_name}"),
+        "status: quarantined".to_string(),
+        "source: auto-generated".to_string(),
+        "---".to_string(),
+        String::new(),
+        "# Auto-generated Skill Draft".to_string(),
+        String::new(),
+        "This draft was generated from normalized verification metadata only. Human review is required before promotion.".to_string(),
+        String::new(),
+        "## Trigger".to_string(),
+        format!(
+            "- Repeated verification failures before green: {failures_before_green} across {iterations} iterations."
+        ),
+        format!("- Adapters involved: {}.", adapter_ids.join(", ")),
+        format!("- Failure kinds observed: {}.", failure_kinds.join(", ")),
+        String::new(),
+        "## Workflow".to_string(),
+        "1. Reproduce the failing verifier step in the smallest change-scoped target available.".to_string(),
+        "2. Inspect the touched files and adjacent tests before broadening scope.".to_string(),
+        "3. Fix the highest-confidence code or config fault first.".to_string(),
+        "4. Re-run quick verification before broader final-gate checks.".to_string(),
+        String::new(),
+        "## Validation".to_string(),
+        format!("- Prefer targeted adapter commands for: {}.", adapter_ids.join(", ")),
+        format!("- Re-check touched files: {}.", touched_files.join(", ")),
+        String::new(),
+        "## Safety".to_string(),
+        "- Do not promote this draft automatically.".to_string(),
+        "- Keep generated guidance limited to normalized metadata; do not paste raw tool output.".to_string(),
+    ];
+    lines.join("\n")
+}
+
+/// Outcome of replaying a generated auto-skill against a stored fixture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AutoSkillFixtureResult {
+    pub passed: bool,
+}
+
+/// Errors from [`promote_auto_skill`]. Deliberately explicit so CI can report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AutoSkillPromotionError {
+    NotEnoughFixtures { have: usize, need: usize },
+    FixtureFailed { index: usize },
+    HumanApprovalMissing,
+    TokenRegressionExceeded { delta_pct: i64, limit_pct: i64 },
+    MetaRead(String),
+    MetaWrite(String),
+}
+
+impl std::fmt::Display for AutoSkillPromotionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotEnoughFixtures { have, need } => {
+                write!(f, "auto-skill requires {need} fixture replays, got {have}")
+            }
+            Self::FixtureFailed { index } => {
+                write!(f, "auto-skill fixture #{index} failed during replay")
+            }
+            Self::HumanApprovalMissing => {
+                write!(
+                    f,
+                    "auto-skill requires explicit human approval before promotion"
+                )
+            }
+            Self::TokenRegressionExceeded {
+                delta_pct,
+                limit_pct,
+            } => write!(
+                f,
+                "auto-skill token regression {delta_pct}% exceeds {limit_pct}% limit"
+            ),
+            Self::MetaRead(msg) => write!(f, "cannot read meta.json: {msg}"),
+            Self::MetaWrite(msg) => write!(f, "cannot update meta.json: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for AutoSkillPromotionError {}
+
+pub const AUTO_SKILL_REQUIRED_FIXTURES: usize = 3;
+pub const AUTO_SKILL_MAX_TOKEN_REGRESSION_PCT: i64 = 10;
+
+/// Promote a quarantined auto-skill draft to `status: active` after gating:
+///   * every fixture in `fixtures` must have `passed = true`,
+///   * there must be at least [`AUTO_SKILL_REQUIRED_FIXTURES`] of them,
+///   * `human_approved` must be explicitly true,
+///   * tokens spent with the skill must not regress more than
+///     [`AUTO_SKILL_MAX_TOKEN_REGRESSION_PCT`]% vs. the baseline.
+///
+/// On success, updates `meta.json` to `status: active` and returns the path.
+pub fn promote_auto_skill(
+    skill_dir: &Path,
+    fixtures: &[AutoSkillFixtureResult],
+    baseline_tokens: u64,
+    current_tokens: u64,
+    human_approved: bool,
+) -> Result<PathBuf, AutoSkillPromotionError> {
+    if fixtures.len() < AUTO_SKILL_REQUIRED_FIXTURES {
+        return Err(AutoSkillPromotionError::NotEnoughFixtures {
+            have: fixtures.len(),
+            need: AUTO_SKILL_REQUIRED_FIXTURES,
+        });
+    }
+    for (index, fixture) in fixtures.iter().enumerate() {
+        if !fixture.passed {
+            return Err(AutoSkillPromotionError::FixtureFailed { index });
+        }
+    }
+    if !human_approved {
+        return Err(AutoSkillPromotionError::HumanApprovalMissing);
+    }
+    if baseline_tokens > 0 {
+        let delta = i128::from(current_tokens) - i128::from(baseline_tokens);
+        let delta_pct = (delta * 100) / i128::from(baseline_tokens);
+        if delta_pct > i128::from(AUTO_SKILL_MAX_TOKEN_REGRESSION_PCT) {
+            return Err(AutoSkillPromotionError::TokenRegressionExceeded {
+                delta_pct: i64::try_from(delta_pct).unwrap_or(i64::MAX),
+                limit_pct: AUTO_SKILL_MAX_TOKEN_REGRESSION_PCT,
+            });
+        }
+    }
+
+    let meta_path = skill_dir.join("meta.json");
+    let raw = fs::read_to_string(&meta_path)
+        .map_err(|error| AutoSkillPromotionError::MetaRead(error.to_string()))?;
+    let mut meta: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|error| AutoSkillPromotionError::MetaRead(error.to_string()))?;
+    if let Some(obj) = meta.as_object_mut() {
+        obj.insert("status".to_string(), json!("active"));
+        obj.insert("requires_human_approval".to_string(), json!(false));
+        obj.insert(
+            "promoted_at_unix_secs".to_string(),
+            json!(std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or_default()),
+        );
+        obj.insert(
+            "promotion_evidence".to_string(),
+            json!({
+                "fixtures_passed": fixtures.len(),
+                "baseline_tokens": baseline_tokens,
+                "current_tokens": current_tokens,
+                "human_approved": human_approved,
+            }),
+        );
+    }
+    fs::write(
+        &meta_path,
+        serde_json::to_string_pretty(&meta)
+            .map_err(|error| AutoSkillPromotionError::MetaWrite(error.to_string()))?,
+    )
+    .map_err(|error| AutoSkillPromotionError::MetaWrite(error.to_string()))?;
+    Ok(skill_dir.to_path_buf())
+}
+
+/// Parameters for [`run_promote_auto_skill_cli`]. Kept as a plain struct so
+/// both the subcommand dispatcher and integration tests can drive it.
+#[derive(Debug, Clone)]
+pub struct PromoteAutoSkillArgs {
+    /// Path to the quarantined skill directory (`.claude/skills/generated/<slug>/`).
+    pub skill_dir: PathBuf,
+    /// JSON file: array of `{ "passed": bool }` objects, one per replay fixture.
+    pub fixtures_json: PathBuf,
+    pub baseline_tokens: u64,
+    pub current_tokens: u64,
+    pub approved: bool,
+}
+
+pub fn run_promote_auto_skill_cli(
+    args: &PromoteAutoSkillArgs,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let raw = fs::read_to_string(&args.fixtures_json)?;
+    let entries: Vec<serde_json::Value> = serde_json::from_str(&raw)?;
+    let fixtures: Vec<AutoSkillFixtureResult> = entries
+        .into_iter()
+        .map(|entry| AutoSkillFixtureResult {
+            passed: entry
+                .get("passed")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+        })
+        .collect();
+
+    let path = promote_auto_skill(
+        &args.skill_dir,
+        &fixtures,
+        args.baseline_tokens,
+        args.current_tokens,
+        args.approved,
+    )?;
+    Ok(path)
+}
+
+fn sanitize_skill_text(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '/' | '\\' | '-' | '_' | '.' | ' ') {
+                ch
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn slugify_token(value: &str) -> String {
+    let mut slug = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    while slug.contains("--") {
+        slug = slug.replace("--", "-");
+    }
+    slug.trim_matches('-').to_string()
+}
+
 fn print_buffered_turn_summary(
     summary: &runtime::TurnSummary,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -7356,6 +8018,7 @@ fn collect_verification_reports(summary: &runtime::TurnSummary) -> Vec<serde_jso
                     .collect::<Vec<_>>(),
                 "status": report.status.as_str(),
                 "summary_text": report.summary_text.clone(),
+                "primary_failure_kind": report.primary_failure_kind().map(runtime::VerificationFailureKind::as_str),
                 "steps": report.steps.iter().map(|step| json!({
                     "adapter": step.adapter.clone(),
                     "project_root": step.project_root.display().to_string(),
@@ -7366,6 +8029,11 @@ fn collect_verification_reports(summary: &runtime::TurnSummary) -> Vec<serde_jso
                     "failure_kind": step.failure_kind.map(runtime::VerificationFailureKind::as_str),
                     "duration_ms": step.duration_ms,
                     "truncated_output": step.truncated_output.clone(),
+                    "step_kind": step.step_kind.clone(),
+                    "target_scope": step.target_scope.clone(),
+                    "package_name": step.package_name.clone(),
+                    "package_manager": step.package_manager.clone(),
+                    "launcher_kind": step.launcher_kind.clone(),
                 })).collect::<Vec<_>>(),
             })
         })
@@ -11986,8 +12654,15 @@ fn write_mcp_server_fixture(script_path: &Path) {
 
 #[cfg(test)]
 mod sandbox_report_tests {
-    use super::{format_sandbox_report, HookAbortMonitor};
-    use runtime::HookAbortSignal;
+    use super::{
+        collect_turn_change_stats, format_sandbox_report, maybe_write_auto_skill_draft,
+        promote_auto_skill, run_promote_auto_skill_cli, should_run_critic, AutoSkillFixtureResult,
+        AutoSkillPromotionError, HookAbortMonitor, PromoteAutoSkillArgs,
+        AUTO_SKILL_MAX_TOKEN_REGRESSION_PCT, AUTO_SKILL_REQUIRED_FIXTURES,
+    };
+    use runtime::{ContentBlock, ConversationMessage, HookAbortSignal, MessageRole, TokenUsage};
+    use serde_json::json;
+    use std::path::Path;
     use std::sync::mpsc;
     use std::time::Duration;
 
@@ -12017,6 +12692,324 @@ mod sandbox_report_tests {
         monitor.stop();
 
         assert!(!abort_signal.is_aborted());
+    }
+
+    fn sample_turn_summary() -> runtime::TurnSummary {
+        runtime::TurnSummary {
+            assistant_messages: vec![ConversationMessage {
+                role: MessageRole::Assistant,
+                blocks: vec![ContentBlock::Text {
+                    text: "done".to_string(),
+                }],
+                usage: None,
+            }],
+            tool_results: vec![ConversationMessage {
+                role: MessageRole::User,
+                blocks: vec![ContentBlock::ToolResult {
+                    tool_use_id: "tool-1".to_string(),
+                    tool_name: "write_file".to_string(),
+                    output: json!({
+                        "filePath": "src/lib.rs",
+                        "structuredPatch": [{
+                            "lines": ["-old", "+new", "+extra"]
+                        }]
+                    })
+                    .to_string(),
+                    is_error: false,
+                }],
+                usage: None,
+            }],
+            verification_reports: vec![],
+            verification_gate: runtime::VerificationGateStatus {
+                attempted: true,
+                passed: true,
+                report_ids: vec!["report-1".to_string()],
+            },
+            prompt_cache_events: vec![],
+            iterations: 1,
+            usage: TokenUsage::default(),
+            auto_compaction: None,
+        }
+    }
+
+    fn sample_verification_report(
+        report_id: &str,
+        phase: runtime::VerificationPhase,
+        status: runtime::VerificationStatus,
+        project_root: &Path,
+    ) -> runtime::VerificationReport {
+        runtime::VerificationReport {
+            report_id: report_id.to_string(),
+            phase,
+            adapter_id: "rust-cargo".to_string(),
+            project_root: project_root.to_path_buf(),
+            touched_paths: vec![project_root.join("src/lib.rs")],
+            status,
+            summary_text: "report".to_string(),
+            steps: vec![],
+        }
+    }
+
+    #[test]
+    fn collect_turn_change_stats_counts_changed_files_and_lines() {
+        let summary = sample_turn_summary();
+        let stats = collect_turn_change_stats(&summary);
+
+        assert_eq!(stats.files.len(), 1);
+        assert_eq!(stats.files[0].path, "src/lib.rs");
+        assert_eq!(stats.files[0].added_lines, 2);
+        assert_eq!(stats.files[0].deleted_lines, 1);
+        assert_eq!(stats.total_changed_lines, 3);
+    }
+
+    #[test]
+    fn should_run_critic_requires_green_nontrivial_turn() {
+        let mut summary = sample_turn_summary();
+        summary.tool_results = (0..4)
+            .map(|index| ConversationMessage {
+                role: MessageRole::User,
+                blocks: vec![ContentBlock::ToolResult {
+                    tool_use_id: format!("tool-{index}"),
+                    tool_name: "write_file".to_string(),
+                    output: json!({
+                        "filePath": format!("src/file-{index}.rs"),
+                        "structuredPatch": [{"lines": ["-old", "+new"]}]
+                    })
+                    .to_string(),
+                    is_error: false,
+                }],
+                usage: None,
+            })
+            .collect();
+        let stats = collect_turn_change_stats(&summary);
+        assert!(should_run_critic(&summary, &stats));
+
+        summary.verification_gate.passed = false;
+        assert!(!should_run_critic(&summary, &stats));
+    }
+
+    #[test]
+    fn auto_skill_draft_writes_quarantined_skill_when_enabled() {
+        let original_dir = std::env::current_dir().expect("cwd");
+        let original_flag = std::env::var("CLAUDE_CODE_AUTO_SKILLS").ok();
+        let root = std::env::temp_dir().join(format!(
+            "claw-auto-skill-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("src")).expect("workspace should exist");
+        std::env::set_current_dir(&root).expect("set cwd");
+        std::env::set_var("CLAUDE_CODE_AUTO_SKILLS", "1");
+
+        let summary = runtime::TurnSummary {
+            assistant_messages: vec![],
+            tool_results: vec![],
+            verification_reports: vec![
+                sample_verification_report(
+                    "report-1",
+                    runtime::VerificationPhase::Quick,
+                    runtime::VerificationStatus::Failed,
+                    &root,
+                ),
+                sample_verification_report(
+                    "report-2",
+                    runtime::VerificationPhase::Quick,
+                    runtime::VerificationStatus::Failed,
+                    &root,
+                ),
+                sample_verification_report(
+                    "report-3",
+                    runtime::VerificationPhase::Final,
+                    runtime::VerificationStatus::Passed,
+                    &root,
+                ),
+            ],
+            verification_gate: runtime::VerificationGateStatus {
+                attempted: true,
+                passed: true,
+                report_ids: vec!["report-3".to_string()],
+            },
+            prompt_cache_events: vec![],
+            iterations: 3,
+            usage: TokenUsage::default(),
+            auto_compaction: None,
+        };
+
+        let generated = maybe_write_auto_skill_draft(&summary).expect("skill draft should write");
+        let skill_dir = generated.expect("skill draft path");
+        assert!(skill_dir.join("SKILL.md").is_file());
+        assert!(skill_dir.join("meta.json").is_file());
+
+        std::env::set_current_dir(original_dir).expect("restore cwd");
+        match original_flag {
+            Some(value) => std::env::set_var("CLAUDE_CODE_AUTO_SKILLS", value),
+            None => std::env::remove_var("CLAUDE_CODE_AUTO_SKILLS"),
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn write_quarantined_skill(dir: &Path) {
+        std::fs::create_dir_all(dir).expect("skill dir");
+        std::fs::write(dir.join("SKILL.md"), "# draft").expect("SKILL.md");
+        let meta = json!({
+            "status": "quarantined",
+            "requires_human_approval": true,
+            "promotion": {
+                "required_fixtures": AUTO_SKILL_REQUIRED_FIXTURES,
+                "max_token_regression_pct": AUTO_SKILL_MAX_TOKEN_REGRESSION_PCT
+            }
+        });
+        std::fs::write(
+            dir.join("meta.json"),
+            serde_json::to_string_pretty(&meta).unwrap(),
+        )
+        .expect("meta.json");
+    }
+
+    fn promo_tmpdir(label: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "claw-promo-{label}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&path).expect("promo dir");
+        path
+    }
+
+    #[test]
+    fn promote_auto_skill_requires_three_fixtures() {
+        let dir = promo_tmpdir("few-fixtures");
+        write_quarantined_skill(&dir);
+        let fixtures = vec![AutoSkillFixtureResult { passed: true }];
+        let err = promote_auto_skill(&dir, &fixtures, 1000, 1000, true).expect_err("should fail");
+        assert!(matches!(
+            err,
+            AutoSkillPromotionError::NotEnoughFixtures { have: 1, need: 3 }
+        ));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn promote_auto_skill_fails_when_any_fixture_fails() {
+        let dir = promo_tmpdir("fixture-fail");
+        write_quarantined_skill(&dir);
+        let fixtures = vec![
+            AutoSkillFixtureResult { passed: true },
+            AutoSkillFixtureResult { passed: false },
+            AutoSkillFixtureResult { passed: true },
+        ];
+        let err = promote_auto_skill(&dir, &fixtures, 1000, 1000, true).expect_err("should fail");
+        assert!(matches!(
+            err,
+            AutoSkillPromotionError::FixtureFailed { index: 1 }
+        ));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn promote_auto_skill_requires_human_approval() {
+        let dir = promo_tmpdir("no-approval");
+        write_quarantined_skill(&dir);
+        let fixtures = vec![AutoSkillFixtureResult { passed: true }; 3];
+        let err = promote_auto_skill(&dir, &fixtures, 1000, 1000, false).expect_err("should fail");
+        assert!(matches!(err, AutoSkillPromotionError::HumanApprovalMissing));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn promote_auto_skill_enforces_10pct_token_budget() {
+        let dir = promo_tmpdir("token-regress");
+        write_quarantined_skill(&dir);
+        let fixtures = vec![AutoSkillFixtureResult { passed: true }; 3];
+        let err = promote_auto_skill(&dir, &fixtures, 1000, 1200, true).expect_err("should fail");
+        match err {
+            AutoSkillPromotionError::TokenRegressionExceeded {
+                delta_pct,
+                limit_pct,
+            } => {
+                assert_eq!(delta_pct, 20);
+                assert_eq!(limit_pct, AUTO_SKILL_MAX_TOKEN_REGRESSION_PCT);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn promote_auto_skill_activates_meta_on_success() {
+        let dir = promo_tmpdir("promote-ok");
+        write_quarantined_skill(&dir);
+        let fixtures = vec![AutoSkillFixtureResult { passed: true }; 3];
+        let promoted =
+            promote_auto_skill(&dir, &fixtures, 1000, 1050, true).expect("should promote");
+        let meta_raw = std::fs::read_to_string(promoted.join("meta.json")).expect("meta readable");
+        let meta: serde_json::Value = serde_json::from_str(&meta_raw).expect("meta json");
+        assert_eq!(meta["status"], "active");
+        assert_eq!(meta["requires_human_approval"], false);
+        assert_eq!(meta["promotion_evidence"]["fixtures_passed"], 3);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn run_promote_auto_skill_cli_reads_fixtures_and_promotes() {
+        let dir = promo_tmpdir("cli-wrapper");
+        write_quarantined_skill(&dir);
+        let fixtures_path = dir.join("fixtures.json");
+        std::fs::write(
+            &fixtures_path,
+            serde_json::to_string(&json!([
+                { "passed": true },
+                { "passed": true },
+                { "passed": true }
+            ]))
+            .unwrap(),
+        )
+        .expect("fixtures.json");
+        let args = PromoteAutoSkillArgs {
+            skill_dir: dir.clone(),
+            fixtures_json: fixtures_path,
+            baseline_tokens: 1_000,
+            current_tokens: 1_050,
+            approved: true,
+        };
+        let promoted = run_promote_auto_skill_cli(&args).expect("cli wrapper should promote");
+        assert_eq!(promoted, dir);
+        let meta: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("meta.json")).expect("meta"))
+                .expect("meta json");
+        assert_eq!(meta["status"], "active");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn run_promote_auto_skill_cli_surfaces_fixture_failures() {
+        let dir = promo_tmpdir("cli-wrapper-fail");
+        write_quarantined_skill(&dir);
+        let fixtures_path = dir.join("fixtures.json");
+        std::fs::write(
+            &fixtures_path,
+            serde_json::to_string(&json!([
+                { "passed": true },
+                { "passed": false },
+                { "passed": true }
+            ]))
+            .unwrap(),
+        )
+        .expect("fixtures.json");
+        let args = PromoteAutoSkillArgs {
+            skill_dir: dir.clone(),
+            fixtures_json: fixtures_path,
+            baseline_tokens: 1_000,
+            current_tokens: 1_000,
+            approved: true,
+        };
+        let err = run_promote_auto_skill_cli(&args).expect_err("should fail");
+        assert!(err.to_string().contains("fixture #1"));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

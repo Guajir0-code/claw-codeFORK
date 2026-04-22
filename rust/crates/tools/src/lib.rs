@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -1842,66 +1843,56 @@ fn from_value<T: for<'de> Deserialize<'de>>(input: &Value) -> Result<T, String> 
 /// ROADMAP #50: Read-only commands targeting CWD paths get `WorkspaceWrite`,
 /// all others remain `DangerFullAccess`.
 fn classify_bash_permission(command: &str) -> PermissionMode {
-    // Read-only commands that are safe when targeting workspace paths
-    const READ_ONLY_COMMANDS: &[&str] = &[
-        "cat", "head", "tail", "less", "more", "ls", "ll", "dir", "find", "test", "[", "[[",
-        "grep", "rg", "awk", "sed", "file", "stat", "readlink", "wc", "sort", "uniq", "cut", "tr",
-        "pwd", "echo", "printf",
-    ];
-
-    // Get the base command (first word before any args or pipes)
-    let base_cmd = command.split_whitespace().next().unwrap_or("");
-    let base_cmd = base_cmd.split('|').next().unwrap_or("").trim();
-    let base_cmd = base_cmd.split(';').next().unwrap_or("").trim();
-    let base_cmd = base_cmd.split('>').next().unwrap_or("").trim();
-    let base_cmd = base_cmd.split('<').next().unwrap_or("").trim();
-
-    // Check if it's a read-only command
-    let cmd_name = base_cmd.split('/').next_back().unwrap_or(base_cmd);
-    let is_read_only = READ_ONLY_COMMANDS.contains(&cmd_name);
-
-    if !is_read_only {
+    let intent = runtime::bash_validation::classify_command(command);
+    if intent != runtime::bash_validation::CommandIntent::ReadOnly {
         return PermissionMode::DangerFullAccess;
     }
 
-    // Check if any path argument is outside workspace
-    // Simple heuristic: check for absolute paths not starting with CWD
-    if has_dangerous_paths(command) {
+    if !matches!(
+        runtime::bash_validation::validate_read_only(command, PermissionMode::ReadOnly),
+        runtime::bash_validation::ValidationResult::Allow
+    ) {
+        return PermissionMode::DangerFullAccess;
+    }
+
+    let workspace = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    if !matches!(
+        runtime::bash_validation::validate_paths(command, &workspace),
+        runtime::bash_validation::ValidationResult::Allow
+    ) {
+        return PermissionMode::DangerFullAccess;
+    }
+    if tool_targets_outside_workspace(command, &workspace) {
         return PermissionMode::DangerFullAccess;
     }
 
     PermissionMode::WorkspaceWrite
 }
 
-/// Check if command has dangerous paths (outside workspace).
-fn has_dangerous_paths(command: &str) -> bool {
-    // Look for absolute paths
-    let tokens: Vec<&str> = command.split_whitespace().collect();
-
-    for token in tokens {
-        // Skip flags/options
+fn tool_targets_outside_workspace(command: &str, workspace: &Path) -> bool {
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_default();
+    for token in command.split_whitespace() {
         if token.starts_with('-') {
             continue;
         }
-
-        // Check for absolute paths
-        if token.starts_with('/') || token.starts_with("~/") {
-            // Check if it's within CWD
-            let path =
-                PathBuf::from(token.replace('~', &std::env::var("HOME").unwrap_or_default()));
-            if let Ok(cwd) = std::env::current_dir() {
-                if !path.starts_with(&cwd) {
-                    return true; // Path outside workspace
-                }
-            }
-        }
-
-        // Check for parent directory traversal that escapes workspace
-        if token.contains("../..") || token.starts_with("../") && !token.starts_with("./") {
+        if token.contains("../..") || (token.starts_with("../") && !token.starts_with("./")) {
             return true;
         }
-    }
 
+        let candidate = token.trim_matches(|ch| matches!(ch, '"' | '\'' | ';' | ',' | ')' | '('));
+        if candidate.starts_with('/') || candidate.starts_with("~/") {
+            let resolved = if candidate.starts_with("~/") {
+                PathBuf::from(candidate.replacen('~', &home, 1))
+            } else {
+                PathBuf::from(candidate)
+            };
+            if !workspace.as_os_str().is_empty() && !resolved.starts_with(workspace) {
+                return true;
+            }
+        }
+    }
     false
 }
 
@@ -2310,6 +2301,25 @@ struct AgentInput {
     model: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReviewFinding {
+    pub severity: String,
+    pub title: String,
+    pub body: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReviewOutcome {
+    pub summary: String,
+    pub findings: Vec<ReviewFinding>,
+    #[serde(rename = "rawResponse")]
+    pub raw_response: String,
+    #[serde(rename = "subagentDepth")]
+    pub subagent_depth: u32,
+}
+
 #[derive(Debug, Deserialize)]
 struct ToolSearchInput {
     query: String,
@@ -2604,6 +2614,8 @@ struct AgentOutput {
     current_blocker: Option<LaneEventBlocker>,
     #[serde(rename = "derivedState")]
     derived_state: String,
+    #[serde(rename = "subagentDepth", default)]
+    subagent_depth: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
 }
@@ -2614,6 +2626,7 @@ struct AgentJob {
     prompt: String,
     system_prompt: Vec<String>,
     allowed_tools: BTreeSet<String>,
+    subagent_depth: u32,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -3473,8 +3486,62 @@ const DEFAULT_AGENT_MODEL: &str = "claude-opus-4-6";
 const DEFAULT_AGENT_SYSTEM_DATE: &str = "2026-03-31";
 const DEFAULT_AGENT_MAX_ITERATIONS: usize = 32;
 
+thread_local! {
+    static SUBAGENT_DEPTH: Cell<u32> = const { Cell::new(0) };
+}
+
+struct SubagentDepthGuard {
+    previous_depth: u32,
+}
+
+impl Drop for SubagentDepthGuard {
+    fn drop(&mut self) {
+        SUBAGENT_DEPTH.with(|depth| depth.set(self.previous_depth));
+    }
+}
+
+fn current_subagent_depth() -> u32 {
+    SUBAGENT_DEPTH.with(Cell::get)
+}
+
+fn enter_subagent_depth(depth: u32) -> SubagentDepthGuard {
+    let previous_depth = SUBAGENT_DEPTH.with(|current| {
+        let previous = current.get();
+        current.set(depth);
+        previous
+    });
+    SubagentDepthGuard { previous_depth }
+}
+
 fn execute_agent(input: AgentInput) -> Result<AgentOutput, String> {
     execute_agent_with_spawn(input, spawn_agent_job)
+}
+
+pub fn run_inline_review(prompt: &str, model: Option<&str>) -> Result<ReviewOutcome, String> {
+    if prompt.trim().is_empty() {
+        return Err(String::from("review prompt must not be empty"));
+    }
+    if current_subagent_depth() > 0 {
+        return Err(String::from(
+            "review critic can only run from top-level depth",
+        ));
+    }
+
+    let subagent_type = "Review";
+    let subagent_depth = 1;
+    let resolved_model = resolve_agent_model(model);
+    let system_prompt = build_agent_system_prompt(subagent_type)?;
+    let allowed_tools = allowed_tools_for_subagent(subagent_type);
+    let mut runtime = build_subagent_runtime(resolved_model, allowed_tools.clone(), system_prompt)?
+        .with_max_iterations(DEFAULT_AGENT_MAX_ITERATIONS);
+    let _depth_guard = enter_subagent_depth(subagent_depth);
+    let summary = runtime
+        .run_turn(prompt.to_string(), None)
+        .map_err(|error| error.to_string())?;
+    Ok(parse_review_outcome(
+        &final_assistant_text(&summary),
+        subagent_depth,
+    ))
 }
 
 fn execute_agent_with_spawn<F>(input: AgentInput, spawn_fn: F) -> Result<AgentOutput, String>
@@ -3494,6 +3561,13 @@ where
     let output_file = output_dir.join(format!("{agent_id}.md"));
     let manifest_file = output_dir.join(format!("{agent_id}.json"));
     let normalized_subagent_type = normalize_subagent_type(input.subagent_type.as_deref());
+    let parent_depth = current_subagent_depth();
+    if normalized_subagent_type == "Review" && parent_depth > 0 {
+        return Err(String::from(
+            "review subagents cannot be spawned from another subagent",
+        ));
+    }
+    let subagent_depth = parent_depth.saturating_add(1);
     let model = resolve_agent_model(input.model.as_deref());
     let agent_name = input
         .name
@@ -3537,6 +3611,7 @@ where
         lane_events: vec![LaneEvent::started(iso8601_now())],
         current_blocker: None,
         derived_state: String::from("working"),
+        subagent_depth,
         error: None,
     };
     write_agent_manifest(&manifest)?;
@@ -3547,6 +3622,7 @@ where
         prompt: input.prompt,
         system_prompt,
         allowed_tools,
+        subagent_depth,
     };
     if let Err(error) = spawn_fn(job) {
         let error = format!("failed to spawn sub-agent: {error}");
@@ -3586,6 +3662,7 @@ fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
 
 fn run_agent_job(job: &AgentJob) -> Result<(), String> {
     let mut runtime = build_agent_runtime(job)?.with_max_iterations(DEFAULT_AGENT_MAX_ITERATIONS);
+    let _depth_guard = enter_subagent_depth(job.subagent_depth);
     let summary = runtime
         .run_turn(job.prompt.clone(), None)
         .map_err(|error| error.to_string())?;
@@ -3601,7 +3678,14 @@ fn build_agent_runtime(
         .model
         .clone()
         .unwrap_or_else(|| DEFAULT_AGENT_MODEL.to_string());
-    let allowed_tools = job.allowed_tools.clone();
+    build_subagent_runtime(model, job.allowed_tools.clone(), job.system_prompt.clone())
+}
+
+fn build_subagent_runtime(
+    model: String,
+    allowed_tools: BTreeSet<String>,
+    system_prompt: Vec<String>,
+) -> Result<ConversationRuntime<ProviderRuntimeClient, SubagentToolExecutor>, String> {
     let api_client = ProviderRuntimeClient::new(model, allowed_tools.clone())?;
     let permission_policy = agent_permission_policy();
     let tool_executor = SubagentToolExecutor::new(allowed_tools)
@@ -3611,7 +3695,7 @@ fn build_agent_runtime(
         api_client,
         tool_executor,
         permission_policy,
-        job.system_prompt.clone(),
+        system_prompt,
     ))
 }
 
@@ -3673,6 +3757,17 @@ fn allowed_tools_for_subagent(subagent_type: &str) -> BTreeSet<String> {
             "TodoWrite",
             "StructuredOutput",
             "SendUserMessage",
+            "PowerShell",
+        ],
+        "Review" => vec![
+            "bash",
+            "read_file",
+            "glob_search",
+            "grep_search",
+            "WebFetch",
+            "WebSearch",
+            "ToolSearch",
+            "StructuredOutput",
             "PowerShell",
         ],
         "claw-guide" => vec![
@@ -4383,6 +4478,130 @@ fn derive_agent_state(
     "truly_idle"
 }
 
+fn parse_review_outcome(raw_response: &str, subagent_depth: u32) -> ReviewOutcome {
+    let parsed = extract_json_value(raw_response)
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+
+    let mut findings = parsed
+        .get("findings")
+        .and_then(serde_json::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(parse_review_finding)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    findings.retain(|finding| !finding.title.trim().is_empty() && !finding.body.trim().is_empty());
+
+    let summary = parsed
+        .get("summary")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map_or_else(
+            || {
+                if findings.is_empty() {
+                    String::from("No review findings.")
+                } else {
+                    format!("Reviewer reported {} finding(s).", findings.len())
+                }
+            },
+            ToString::to_string,
+        );
+
+    ReviewOutcome {
+        summary,
+        findings,
+        raw_response: raw_response.trim().to_string(),
+        subagent_depth,
+    }
+}
+
+fn parse_review_finding(value: &serde_json::Value) -> Option<ReviewFinding> {
+    let object = value.as_object()?;
+    let severity = object
+        .get("severity")
+        .or_else(|| object.get("priority"))
+        .and_then(serde_json::Value::as_str)
+        .map_or_else(|| String::from("P2"), normalize_review_severity);
+    let title = object
+        .get("title")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let body = object
+        .get("body")
+        .or_else(|| object.get("message"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let file = object
+        .get("file")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+    Some(ReviewFinding {
+        severity,
+        title,
+        body,
+        file,
+    })
+}
+
+fn normalize_review_severity(value: &str) -> String {
+    match value.trim().to_ascii_uppercase().as_str() {
+        "P0" => String::from("P0"),
+        "P1" => String::from("P1"),
+        "P3" => String::from("P3"),
+        _ => String::from("P2"),
+    }
+}
+
+fn extract_json_value(raw: &str) -> Option<serde_json::Value> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Ok(value) = serde_json::from_str(trimmed) {
+        return Some(value);
+    }
+
+    for fence in ["```json", "```JSON", "```"] {
+        if let Some(start) = trimmed.find(fence) {
+            let after_fence = &trimmed[start + fence.len()..];
+            if let Some(end) = after_fence.find("```") {
+                let candidate = after_fence[..end].trim();
+                if let Ok(value) = serde_json::from_str(candidate) {
+                    return Some(value);
+                }
+            }
+        }
+    }
+
+    extract_braced_json(trimmed)
+}
+
+fn extract_braced_json(raw: &str) -> Option<serde_json::Value> {
+    let mut starts = raw
+        .char_indices()
+        .filter_map(|(index, ch)| matches!(ch, '{' | '[').then_some(index))
+        .collect::<Vec<_>>();
+    starts.reverse();
+    for start in starts {
+        let candidate = raw[start..].trim();
+        if let Ok(value) = serde_json::from_str(candidate) {
+            return Some(value);
+        }
+    }
+    None
+}
+
 fn maybe_commit_provenance(result: Option<&str>) -> Option<LaneCommitProvenance> {
     let commit = extract_commit_sha(result?)?;
     let branch = current_git_branch().unwrap_or_else(|| "unknown".to_string());
@@ -4771,9 +4990,54 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
                         }],
                         is_error: *is_error,
                     },
-                    ContentBlock::VerificationReport { summary_text, .. } => {
-                        InputContentBlock::Text {
-                            text: summary_text.clone(),
+                    ContentBlock::VerificationReport {
+                        summary_text,
+                        adapter_id,
+                        project_root,
+                        touched_paths,
+                        primary_failure,
+                        steps,
+                        report_mode,
+                        ..
+                    } => {
+                        if report_mode.as_deref() == Some("typed-primary") {
+                            let payload = json!({
+                                "type": "verification_report",
+                                "adapter_id": adapter_id,
+                                "project_root": project_root,
+                                "touched_paths": touched_paths,
+                                "primary_failure": primary_failure.as_ref().map(|failure| json!({
+                                    "label": failure.label,
+                                    "status": failure.status.as_str(),
+                                    "failure_kind": failure.failure_kind,
+                                    "output_excerpt": failure.output_excerpt,
+                                    "step_kind": failure.step_kind,
+                                    "target_scope": failure.target_scope,
+                                    "package_name": failure.package_name,
+                                    "package_manager": failure.package_manager,
+                                    "launcher_kind": failure.launcher_kind,
+                                })),
+                                "steps": steps.iter().map(|step| json!({
+                                    "label": step.label,
+                                    "status": step.status.as_str(),
+                                    "failure_kind": step.failure_kind,
+                                    "duration_ms": step.duration_ms,
+                                    "step_kind": step.step_kind,
+                                    "target_scope": step.target_scope,
+                                    "package_name": step.package_name,
+                                    "package_manager": step.package_manager,
+                                    "launcher_kind": step.launcher_kind,
+                                })).collect::<Vec<_>>(),
+                            });
+                            let payload = serde_json::to_string(&payload)
+                                .unwrap_or_else(|_| summary_text.clone());
+                            InputContentBlock::Text {
+                                text: format!("{payload}\n\n[verifier summary]\n{summary_text}"),
+                            }
+                        } else {
+                            InputContentBlock::Text {
+                                text: summary_text.clone(),
+                            }
                         }
                     }
                 })
@@ -5043,6 +5307,7 @@ fn normalize_subagent_type(subagent_type: Option<&str>) -> String {
         "verification" | "verificationagent" | "verify" | "verifier" => {
             String::from("Verification")
         }
+        "review" | "reviewagent" | "critic" | "criticagent" => String::from("Review"),
         "clawguide" | "clawguideagent" | "guide" => String::from("claw-guide"),
         "statusline" | "statuslinesetup" => String::from("statusline-setup"),
         _ => trimmed.to_string(),
@@ -6132,18 +6397,24 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        agent_permission_policy, allowed_tools_for_subagent, classify_lane_failure,
-        derive_agent_state, execute_agent_with_spawn, execute_tool, extract_recovery_outcome,
-        final_assistant_text, global_cron_registry, maybe_commit_provenance, mvp_tool_specs,
-        permission_mode_from_plugin, persist_agent_terminal_state, push_output_block,
-        run_task_packet, AgentInput, AgentJob, GlobalToolRegistry, LaneEventName, LaneFailureClass,
-        ProviderRuntimeClient, SubagentToolExecutor,
+        agent_permission_policy, allowed_tools_for_subagent, classify_bash_permission,
+        classify_lane_failure, convert_messages, derive_agent_state, enter_subagent_depth,
+        execute_agent_with_spawn, execute_tool, extract_recovery_outcome, final_assistant_text,
+        global_cron_registry, maybe_commit_provenance, mvp_tool_specs, normalize_subagent_type,
+        parse_review_outcome, permission_mode_from_plugin, persist_agent_terminal_state,
+        push_output_block, run_inline_review, run_task_packet, AgentInput, AgentJob,
+        GlobalToolRegistry, LaneEventName, LaneFailureClass, ProviderRuntimeClient,
+        SubagentToolExecutor, DEFAULT_AGENT_MODEL,
     };
-    use api::OutputContentBlock;
+    use api::{InputContentBlock, OutputContentBlock};
+    use runtime::verifier::VerificationStepReport;
     use runtime::ProviderFallbackConfig;
     use runtime::{
-        permission_enforcer::PermissionEnforcer, ApiRequest, AssistantEvent, ConversationRuntime,
-        PermissionMode, PermissionPolicy, RuntimeError, Session, TaskPacket, ToolExecutor,
+        permission_enforcer::{EnforcementResult, PermissionEnforcer},
+        ApiRequest, AssistantEvent, ContentBlock, ConversationMessage, ConversationRuntime,
+        MessageRole, PermissionMode, PermissionPolicy, RuntimeError, Session, TaskPacket,
+        ToolExecutor, VerificationFailureKind, VerificationPhase, VerificationReport,
+        VerificationStatus,
     };
     use serde_json::json;
 
@@ -8386,6 +8657,62 @@ mod tests {
         assert!(verification.contains("bash"));
         assert!(verification.contains("PowerShell"));
         assert!(!verification.contains("write_file"));
+
+        let review = allowed_tools_for_subagent("Review");
+        assert!(review.contains("bash"));
+        assert!(review.contains("read_file"));
+        assert!(review.contains("StructuredOutput"));
+        assert!(!review.contains("write_file"));
+        assert!(!review.contains("Agent"));
+    }
+
+    #[test]
+    fn review_outcome_parses_json_and_normalizes_severity() {
+        let outcome = parse_review_outcome(
+            r#"{
+                "summary": "Found one blocking issue.",
+                "findings": [
+                    {
+                        "severity": "p1",
+                        "title": "Null dereference",
+                        "body": "The new path dereferences an optional value without checking it.",
+                        "file": "src/lib.rs"
+                    }
+                ]
+            }"#,
+            1,
+        );
+
+        assert_eq!(outcome.summary, "Found one blocking issue.");
+        assert_eq!(outcome.subagent_depth, 1);
+        assert_eq!(outcome.findings.len(), 1);
+        assert_eq!(outcome.findings[0].severity, "P1");
+        assert_eq!(outcome.findings[0].file.as_deref(), Some("src/lib.rs"));
+    }
+
+    #[test]
+    fn review_outcome_extracts_fenced_json_payloads() {
+        let outcome = parse_review_outcome(
+            "Review complete.\n```json\n{\"findings\":[],\"summary\":\"No issues.\"}\n```",
+            1,
+        );
+
+        assert!(outcome.findings.is_empty());
+        assert_eq!(outcome.summary, "No issues.");
+    }
+
+    #[test]
+    fn normalize_subagent_type_maps_review_aliases() {
+        assert_eq!(normalize_subagent_type(Some("review")), "Review");
+        assert_eq!(normalize_subagent_type(Some("critic")), "Review");
+    }
+
+    #[test]
+    fn inline_review_rejects_nested_depth() {
+        let _guard = enter_subagent_depth(1);
+        let error = run_inline_review("{}", Some(DEFAULT_AGENT_MODEL))
+            .expect_err("nested inline review should fail");
+        assert!(error.contains("top-level depth"));
     }
 
     #[derive(Debug)]
@@ -8938,6 +9265,159 @@ mod tests {
             execute_tool("Sleep", &json!({"duration_ms": 0})).expect("0ms sleep should succeed");
         let output: serde_json::Value = serde_json::from_str(&result).expect("json");
         assert_eq!(output["duration_ms"], 0);
+    }
+
+    #[test]
+    fn convert_messages_keeps_text_primary_verification_reports_as_summary_text() {
+        let report = sample_verification_report();
+        let messages = vec![ConversationMessage {
+            role: MessageRole::Verification,
+            blocks: vec![ContentBlock::VerificationReport {
+                report_id: report.report_id.clone(),
+                phase: report.phase,
+                status: report.status,
+                summary_text: report.summary_text.clone(),
+                adapter_id: Some(report.adapter_id.clone()),
+                project_root: Some(report.project_root.display().to_string()),
+                touched_paths: report
+                    .touched_paths
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect(),
+                primary_failure: None,
+                steps: Vec::new(),
+                report_mode: Some("text-primary".to_string()),
+            }],
+            usage: None,
+        }];
+
+        let converted = convert_messages(&messages);
+
+        assert_eq!(converted.len(), 1);
+        match &converted[0].content[0] {
+            InputContentBlock::Text { text } => assert_eq!(text, report.summary_text.as_str()),
+            other => panic!("expected text block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn convert_messages_emits_compact_json_for_typed_primary_verification_reports() {
+        let report = sample_verification_report();
+        let message = ConversationMessage::verification_report(&report, Some("typed-primary"));
+
+        let converted = convert_messages(&[message]);
+
+        assert_eq!(converted.len(), 1);
+        match &converted[0].content[0] {
+            InputContentBlock::Text { text } => {
+                assert!(text.contains("\"type\":\"verification_report\""));
+                assert!(text.contains("\"adapter_id\":\"rust-cargo\""));
+                assert!(text.contains("\"failure_kind\":\"code\""));
+                assert!(text.contains("[verifier summary]"));
+                assert!(text.contains(&report.summary_text));
+            }
+            other => panic!("expected text block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bash_validation_parity_read_only_primitive_is_shared() {
+        // Paridade: tools/src/lib.rs:classify_bash_permission (call site ~1846) e
+        // runtime::permission_enforcer::check_bash (call site ~151) devem concordar
+        // sobre a classificação de "read-only" porque ambos delegam para
+        // `runtime::bash_validation::validate_read_only`.
+        //
+        // Invariantes:
+        //   (1) validate_read_only(cmd, ReadOnly) == Allow  ⇔
+        //       enforcer(ReadOnly).check_bash(cmd) == Allowed
+        //   (2) validate_read_only(cmd, ReadOnly) != Allow  ⇒
+        //       classify_bash_permission(cmd) == DangerFullAccess
+        //   (3) Quando (1) e validate_paths(cmd, cwd) == Allow,
+        //       classify_bash_permission(cmd) == WorkspaceWrite.
+        let enforcer = PermissionEnforcer::new(PermissionPolicy::new(PermissionMode::ReadOnly));
+        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+
+        let commands = [
+            "ls",
+            "cat src/lib.rs",
+            "grep -n alpha src/lib.rs",
+            "cat /etc/passwd",
+            "rm src/lib.rs",
+            "echo hi > out.txt",
+            "pwd",
+            "git status",
+            "mkdir new",
+            "head -n 5 Cargo.toml",
+        ];
+
+        for command in commands {
+            let read_only_allow = matches!(
+                runtime::bash_validation::validate_read_only(command, PermissionMode::ReadOnly),
+                runtime::bash_validation::ValidationResult::Allow
+            );
+            let enforcer_allow = matches!(enforcer.check_bash(command), EnforcementResult::Allowed);
+            assert_eq!(
+                read_only_allow, enforcer_allow,
+                "invariant (1) violated for `{command}`: read_only_allow={read_only_allow}, enforcer_allow={enforcer_allow}"
+            );
+
+            let tool_mode = classify_bash_permission(command);
+            if !read_only_allow {
+                assert_eq!(
+                    tool_mode,
+                    PermissionMode::DangerFullAccess,
+                    "invariant (2) violated for `{command}`: tool_mode={tool_mode:?}"
+                );
+                continue;
+            }
+
+            let paths_allow = matches!(
+                runtime::bash_validation::validate_paths(command, &cwd),
+                runtime::bash_validation::ValidationResult::Allow
+            );
+            if paths_allow && !crate::tool_targets_outside_workspace(command, &cwd) {
+                assert_eq!(
+                    tool_mode,
+                    PermissionMode::WorkspaceWrite,
+                    "invariant (3) violated for `{command}`: tool_mode={tool_mode:?}"
+                );
+            } else {
+                assert_eq!(
+                    tool_mode,
+                    PermissionMode::DangerFullAccess,
+                    "out-of-workspace path must escalate for `{command}`: tool_mode={tool_mode:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bash_permission_matrix_documents_current_overlap_with_runtime_enforcer() {
+        let enforcer = PermissionEnforcer::new(PermissionPolicy::new(PermissionMode::ReadOnly));
+        let cases = [
+            ("cat src/lib.rs", PermissionMode::WorkspaceWrite, true),
+            (
+                "grep -n alpha src/lib.rs",
+                PermissionMode::WorkspaceWrite,
+                true,
+            ),
+            ("cat /etc/passwd", PermissionMode::DangerFullAccess, true),
+            ("rm src/lib.rs", PermissionMode::DangerFullAccess, false),
+            ("echo hi > out.txt", PermissionMode::DangerFullAccess, false),
+        ];
+
+        for (command, expected_mode, enforcer_allows) in cases {
+            assert_eq!(
+                classify_bash_permission(command),
+                expected_mode,
+                "unexpected tool-side classification for {command}"
+            );
+            let allowed = matches!(enforcer.check_bash(command), EnforcementResult::Allowed);
+            assert_eq!(
+                allowed, enforcer_allows,
+                "unexpected enforcer outcome for {command}"
+            );
+        }
     }
 
     #[test]
@@ -9683,6 +10163,36 @@ mod tests {
                 self.body
             )
             .into_bytes()
+        }
+    }
+
+    fn sample_verification_report() -> VerificationReport {
+        VerificationReport {
+            report_id: "tool-typed-report".to_string(),
+            phase: VerificationPhase::Quick,
+            adapter_id: "rust-cargo".to_string(),
+            project_root: PathBuf::from("/workspace"),
+            touched_paths: vec![PathBuf::from("src/lib.rs")],
+            status: VerificationStatus::Failed,
+            summary_text:
+                "[verifier:quick:rust-cargo] failed (/workspace)\n[verifier] cargo check: FAIL"
+                    .to_string(),
+            steps: vec![VerificationStepReport {
+                adapter: "rust-cargo".to_string(),
+                project_root: PathBuf::from("/workspace"),
+                label: "cargo check".to_string(),
+                command: "cargo check -p demo".to_string(),
+                phase: VerificationPhase::Quick,
+                status: VerificationStatus::Failed,
+                failure_kind: Some(VerificationFailureKind::Code),
+                duration_ms: 41,
+                truncated_output: "error[E0308]: mismatched types".to_string(),
+                step_kind: Some("cargo_check".to_string()),
+                target_scope: Some("package".to_string()),
+                package_name: Some("demo".to_string()),
+                package_manager: None,
+                launcher_kind: None,
+            }],
         }
     }
 }

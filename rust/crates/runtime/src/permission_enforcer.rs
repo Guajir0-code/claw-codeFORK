@@ -6,6 +6,7 @@
 //! Permission enforcement layer that gates tool execution based on the
 //! active `PermissionPolicy`.
 
+use crate::bash_validation::{validate_read_only, ValidationResult};
 use crate::permissions::{PermissionMode, PermissionOutcome, PermissionPolicy};
 use serde::{Deserialize, Serialize};
 
@@ -146,21 +147,21 @@ impl PermissionEnforcer {
         let mode = self.policy.active_mode();
 
         match mode {
-            PermissionMode::ReadOnly => {
-                if is_read_only_command(command) {
-                    EnforcementResult::Allowed
-                } else {
-                    EnforcementResult::Denied {
-                        tool: "bash".to_owned(),
-                        active_mode: mode.as_str().to_owned(),
-                        required_mode: PermissionMode::WorkspaceWrite.as_str().to_owned(),
-                        reason: format!(
-                            "command may modify state; not allowed in '{}' mode",
-                            mode.as_str()
-                        ),
-                    }
-                }
-            }
+            PermissionMode::ReadOnly => match validate_read_only(command, mode) {
+                ValidationResult::Allow => EnforcementResult::Allowed,
+                ValidationResult::Block { reason } => EnforcementResult::Denied {
+                    tool: "bash".to_owned(),
+                    active_mode: mode.as_str().to_owned(),
+                    required_mode: PermissionMode::WorkspaceWrite.as_str().to_owned(),
+                    reason,
+                },
+                ValidationResult::Warn { message } => EnforcementResult::Denied {
+                    tool: "bash".to_owned(),
+                    active_mode: mode.as_str().to_owned(),
+                    required_mode: PermissionMode::WorkspaceWrite.as_str().to_owned(),
+                    reason: message,
+                },
+            },
             PermissionMode::Prompt => EnforcementResult::Denied {
                 tool: "bash".to_owned(),
                 active_mode: mode.as_str().to_owned(),
@@ -190,85 +191,20 @@ fn is_within_workspace(path: &str, workspace_root: &str) -> bool {
     normalized.starts_with(&root) || normalized == workspace_root.trim_end_matches('/')
 }
 
-/// Conservative heuristic: is this bash command read-only?
+#[cfg(test)]
 fn is_read_only_command(command: &str) -> bool {
-    let first_token = command
-        .split_whitespace()
-        .next()
-        .unwrap_or("")
-        .rsplit('/')
-        .next()
-        .unwrap_or("");
-
+    let trimmed = command.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if trimmed.contains(" -i ") || trimmed.contains(" --in-place") || trimmed.starts_with("sed -i")
+    {
+        return false;
+    }
     matches!(
-        first_token,
-        "cat"
-            | "head"
-            | "tail"
-            | "less"
-            | "more"
-            | "wc"
-            | "ls"
-            | "find"
-            | "grep"
-            | "rg"
-            | "awk"
-            | "sed"
-            | "echo"
-            | "printf"
-            | "which"
-            | "where"
-            | "whoami"
-            | "pwd"
-            | "env"
-            | "printenv"
-            | "date"
-            | "cal"
-            | "df"
-            | "du"
-            | "free"
-            | "uptime"
-            | "uname"
-            | "file"
-            | "stat"
-            | "diff"
-            | "sort"
-            | "uniq"
-            | "tr"
-            | "cut"
-            | "paste"
-            | "tee"
-            | "xargs"
-            | "test"
-            | "true"
-            | "false"
-            | "type"
-            | "readlink"
-            | "realpath"
-            | "basename"
-            | "dirname"
-            | "sha256sum"
-            | "md5sum"
-            | "b3sum"
-            | "xxd"
-            | "hexdump"
-            | "od"
-            | "strings"
-            | "tree"
-            | "jq"
-            | "yq"
-            | "python3"
-            | "python"
-            | "node"
-            | "ruby"
-            | "cargo"
-            | "rustc"
-            | "git"
-            | "gh"
-    ) && !command.contains("-i ")
-        && !command.contains("--in-place")
-        && !command.contains(" > ")
-        && !command.contains(" >> ")
+        validate_read_only(command, PermissionMode::ReadOnly),
+        ValidationResult::Allow
+    )
 }
 
 #[cfg(test)]

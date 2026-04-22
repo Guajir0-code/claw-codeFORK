@@ -206,6 +206,18 @@ fn prepare_command(
         prepared.env("HOME", cwd.join(".sandbox-home"));
         prepared.env("TMPDIR", cwd.join(".sandbox-tmp"));
     }
+    #[cfg(windows)]
+    {
+        if !posix_shell_available() {
+            let mut prepared = Command::new("powershell");
+            prepared.args(windows_shell_args(command)).current_dir(cwd);
+            if sandbox_status.filesystem_active {
+                prepared.env("HOME", cwd.join(".sandbox-home"));
+                prepared.env("TMPDIR", cwd.join(".sandbox-tmp"));
+            }
+            return prepared;
+        }
+    }
     prepared
 }
 
@@ -233,12 +245,132 @@ fn prepare_tokio_command(
         prepared.env("HOME", cwd.join(".sandbox-home"));
         prepared.env("TMPDIR", cwd.join(".sandbox-tmp"));
     }
+    #[cfg(windows)]
+    {
+        if !posix_shell_available() {
+            let mut prepared = TokioCommand::new("powershell");
+            prepared.args(windows_shell_args(command)).current_dir(cwd);
+            if sandbox_status.filesystem_active {
+                prepared.env("HOME", cwd.join(".sandbox-home"));
+                prepared.env("TMPDIR", cwd.join(".sandbox-tmp"));
+            }
+            return prepared;
+        }
+    }
     prepared
 }
 
 fn prepare_sandbox_dirs(cwd: &std::path::Path) {
     let _ = std::fs::create_dir_all(cwd.join(".sandbox-home"));
     let _ = std::fs::create_dir_all(cwd.join(".sandbox-tmp"));
+}
+
+#[cfg(windows)]
+fn posix_shell_available() -> bool {
+    use std::sync::OnceLock;
+
+    static HAS_SH: OnceLock<bool> = OnceLock::new();
+    *HAS_SH.get_or_init(|| {
+        Command::new("sh")
+            .arg("-lc")
+            .arg("printf ok")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    })
+}
+
+#[cfg(windows)]
+fn windows_shell_args(command: &str) -> Vec<String> {
+    if let Some(script) = translate_posix_snippet_to_powershell(command) {
+        vec![
+            "-NoProfile".to_string(),
+            "-EncodedCommand".to_string(),
+            encode_powershell(&script),
+        ]
+    } else {
+        vec![
+            "-NoProfile".to_string(),
+            "-Command".to_string(),
+            command.to_string(),
+        ]
+    }
+}
+
+#[cfg(windows)]
+fn translate_posix_snippet_to_powershell(command: &str) -> Option<String> {
+    if let Some((text, exit_code)) = command
+        .strip_prefix("printf '")
+        .and_then(|rest| rest.split_once("'; exit "))
+    {
+        return Some(format!(
+            "[Console]::Out.Write({}); exit {exit_code}",
+            powershell_literal(text)
+        ));
+    }
+
+    if let Some((text, exit_code)) = command
+        .strip_prefix("printf '")
+        .and_then(|rest| rest.split_once("' >&2; exit "))
+    {
+        return Some(format!(
+            "[Console]::Error.Write({}); exit {exit_code}",
+            powershell_literal(text)
+        ));
+    }
+
+    if let Some(text) = command
+        .strip_prefix("printf '")
+        .and_then(|rest| rest.strip_suffix('\''))
+    {
+        return Some(format!(
+            "[Console]::Out.Write({})",
+            powershell_literal(text)
+        ));
+    }
+
+    None
+}
+
+#[cfg(windows)]
+fn powershell_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+#[cfg(windows)]
+fn encode_powershell(script: &str) -> String {
+    let bytes: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    encode_base64(&bytes)
+}
+
+#[cfg(windows)]
+fn encode_base64(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
+
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = *chunk.get(1).unwrap_or(&0);
+        let b2 = *chunk.get(2).unwrap_or(&0);
+        let n = (u32::from(b0) << 16) | (u32::from(b1) << 8) | u32::from(b2);
+
+        encoded.push(TABLE[((n >> 18) & 0x3F) as usize] as char);
+        encoded.push(TABLE[((n >> 12) & 0x3F) as usize] as char);
+        encoded.push(if chunk.len() > 1 {
+            TABLE[((n >> 6) & 0x3F) as usize] as char
+        } else {
+            '='
+        });
+        encoded.push(if chunk.len() > 2 {
+            TABLE[(n & 0x3F) as usize] as char
+        } else {
+            '='
+        });
+    }
+
+    encoded
 }
 
 #[cfg(test)]

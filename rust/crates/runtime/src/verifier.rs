@@ -166,6 +166,11 @@ pub struct VerificationStepReport {
     pub failure_kind: Option<VerificationFailureKind>,
     pub duration_ms: u64,
     pub truncated_output: String,
+    pub step_kind: Option<String>,
+    pub target_scope: Option<String>,
+    pub package_name: Option<String>,
+    pub package_manager: Option<String>,
+    pub launcher_kind: Option<String>,
 }
 
 /// Structured output of a full verification pass for one adapter/root pair.
@@ -201,6 +206,72 @@ impl VerificationReport {
         } else {
             first.to_string()
         }
+    }
+
+    #[must_use]
+    pub fn primary_step(&self) -> Option<&VerificationStepReport> {
+        self.steps
+            .iter()
+            .find(|step| !step.status.is_success())
+            .or_else(|| self.steps.first())
+    }
+
+    #[must_use]
+    pub fn primary_failure_kind(&self) -> Option<VerificationFailureKind> {
+        self.primary_step().and_then(|step| step.failure_kind)
+    }
+
+    #[must_use]
+    pub fn compact_payload(&self) -> Value {
+        let steps = self
+            .steps
+            .iter()
+            .map(|step| {
+                serde_json::json!({
+                    "label": step.label,
+                    "status": step.status.as_str(),
+                    "failure_kind": step.failure_kind.map(VerificationFailureKind::as_str),
+                    "duration_ms": step.duration_ms,
+                    "step_kind": step.step_kind,
+                    "target_scope": step.target_scope,
+                    "package_name": step.package_name,
+                    "package_manager": step.package_manager,
+                    "launcher_kind": step.launcher_kind,
+                })
+            })
+            .collect::<Vec<_>>();
+        let primary_failure = self.primary_step().and_then(|step| {
+            (!step.status.is_success()).then(|| {
+                serde_json::json!({
+                    "label": step.label,
+                    "status": step.status.as_str(),
+                    "failure_kind": step.failure_kind.map(VerificationFailureKind::as_str),
+                    "output_excerpt": truncate_output(&step.truncated_output, 512),
+                    "step_kind": step.step_kind,
+                    "target_scope": step.target_scope,
+                    "package_name": step.package_name,
+                    "package_manager": step.package_manager,
+                    "launcher_kind": step.launcher_kind,
+                })
+            })
+        });
+
+        serde_json::json!({
+            "type": "verification_report",
+            "report_id": self.report_id,
+            "adapter_id": self.adapter_id,
+            "phase": self.phase.as_str(),
+            "status": self.status.as_str(),
+            "project_root": self.project_root.display().to_string(),
+            "touched_paths": self
+                .touched_paths
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>(),
+            "primary_failure": primary_failure,
+            "steps": steps,
+            "summary_text": self.short_summary(),
+        })
     }
 }
 
@@ -238,6 +309,7 @@ pub trait Verifier: Send {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CargoVerifierConfig {
     pub legacy_mode: bool,
+    pub auto_mode: bool,
     pub quick_on_write: bool,
     pub final_gate: bool,
     pub max_output_bytes: usize,
@@ -256,6 +328,7 @@ impl Default for CargoVerifierConfig {
     fn default() -> Self {
         Self {
             legacy_mode: true,
+            auto_mode: false,
             quick_on_write: true,
             final_gate: false,
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
@@ -298,8 +371,20 @@ impl Verifier for CargoVerifier {
             return Vec::new();
         };
 
-        for adapter in [Adapter::Rust, Adapter::NodeTypeScript, Adapter::Python] {
+        let adapters: Vec<Adapter> = if self.config.auto_mode {
+            match detect_adapter_by_marker(path) {
+                Some(adapter) => vec![adapter],
+                None => return Vec::new(),
+            }
+        } else {
+            vec![Adapter::Rust, Adapter::NodeTypeScript, Adapter::Python]
+        };
+
+        for adapter in adapters {
             if let Some(report) = adapter.quick_verify(path, context, &self.config) {
+                if self.config.auto_mode && report.steps.is_empty() {
+                    continue;
+                }
                 return vec![report];
             }
         }
@@ -396,6 +481,58 @@ enum PackageManager {
     Bun,
 }
 
+impl PackageManager {
+    #[must_use]
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Npm => "npm",
+            Self::Pnpm => "pnpm",
+            Self::Yarn => "yarn",
+            Self::Bun => "bun",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VerificationTargetScope {
+    Workspace,
+    Package,
+    FileSet,
+    Project,
+}
+
+impl VerificationTargetScope {
+    #[must_use]
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Workspace => "workspace",
+            Self::Package => "package",
+            Self::FileSet => "file_set",
+            Self::Project => "project",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RustStepKind {
+    Check,
+    Clippy,
+    FmtCheck,
+    Test,
+}
+
+impl RustStepKind {
+    #[must_use]
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Check => "cargo_check",
+            Self::Clippy => "cargo_clippy",
+            Self::FmtCheck => "cargo_fmt_check",
+            Self::Test => "cargo_test",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PythonLauncherKind {
     Uv,
@@ -404,9 +541,41 @@ enum PythonLauncherKind {
     Global,
 }
 
+impl PythonLauncherKind {
+    #[must_use]
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Uv => "uv",
+            Self::Poetry => "poetry",
+            Self::Venv => "venv",
+            Self::Global => "global",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PythonRunner {
     command_prefix: Vec<String>,
+}
+
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RustProjectProfile {
+    project_root: PathBuf,
+    manifest_path: PathBuf,
+    package_name: Option<String>,
+    manifest_parsed: bool,
+    manifest_parse_error: Option<String>,
+}
+
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NodeProjectProfile {
+    project_root: PathBuf,
+    package_json_path: PathBuf,
+    package_value: Value,
+    package_manager: PackageManager,
+    package_name: Option<String>,
 }
 
 #[allow(clippy::struct_excessive_bools)]
@@ -433,13 +602,108 @@ enum PythonStepKind {
     PyCompile,
 }
 
+impl PythonStepKind {
+    #[must_use]
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::RuffCheck => "ruff_check",
+            Self::Mypy => "mypy",
+            Self::Pytest => "pytest",
+            Self::PyCompile => "py_compile",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NodeStepKind {
+    Typecheck,
+    TscNoEmit,
+    Lint,
+    Eslint,
+    Test,
+}
+
+impl NodeStepKind {
+    #[must_use]
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Typecheck => "typecheck",
+            Self::TscNoEmit => "tsc_no_emit",
+            Self::Lint => "lint",
+            Self::Eslint => "eslint",
+            Self::Test => "test",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum StepDiagnostics {
-    Generic,
+    Rust {
+        step_kind: RustStepKind,
+        target_scope: VerificationTargetScope,
+        package_name: Option<String>,
+    },
+    NodeTypeScript {
+        step_kind: NodeStepKind,
+        target_scope: VerificationTargetScope,
+        package_manager: PackageManager,
+        package_name: Option<String>,
+    },
     Python {
         launcher_kind: PythonLauncherKind,
         step_kind: PythonStepKind,
+        target_scope: VerificationTargetScope,
     },
+}
+
+impl StepDiagnostics {
+    #[must_use]
+    #[allow(clippy::unnecessary_wraps)] // feeds Option<String> field for session compat
+    fn step_kind(&self) -> Option<String> {
+        match self {
+            Self::Rust { step_kind, .. } => Some(step_kind.as_str().to_string()),
+            Self::NodeTypeScript { step_kind, .. } => Some(step_kind.as_str().to_string()),
+            Self::Python { step_kind, .. } => Some(step_kind.as_str().to_string()),
+        }
+    }
+
+    #[must_use]
+    #[allow(clippy::unnecessary_wraps)] // feeds Option<String> field for session compat
+    fn target_scope(&self) -> Option<String> {
+        match self {
+            Self::Rust { target_scope, .. }
+            | Self::NodeTypeScript { target_scope, .. }
+            | Self::Python { target_scope, .. } => Some(target_scope.as_str().to_string()),
+        }
+    }
+
+    #[must_use]
+    fn package_name(&self) -> Option<String> {
+        match self {
+            Self::Rust { package_name, .. } | Self::NodeTypeScript { package_name, .. } => {
+                package_name.clone()
+            }
+            Self::Python { .. } => None,
+        }
+    }
+
+    #[must_use]
+    fn package_manager(&self) -> Option<String> {
+        match self {
+            Self::NodeTypeScript {
+                package_manager, ..
+            } => Some(package_manager.as_str().to_string()),
+            Self::Rust { .. } | Self::Python { .. } => None,
+        }
+    }
+
+    #[must_use]
+    fn launcher_kind(&self) -> Option<String> {
+        match self {
+            Self::Python { launcher_kind, .. } => Some(launcher_kind.as_str().to_string()),
+            Self::Rust { .. } | Self::NodeTypeScript { .. } => None,
+        }
+    }
 }
 
 fn verify_rust(
@@ -447,18 +711,25 @@ fn verify_rust(
     context: &VerificationContext,
     config: &CargoVerifierConfig,
 ) -> Option<VerificationReport> {
-    let manifest = nearest_file(path, "Cargo.toml")?;
-    let project_root = manifest.parent()?.to_path_buf();
+    let profile = build_rust_profile_for_path(path)?;
+    if let Some(report) = rust_config_failure_report(
+        &profile,
+        context.phase,
+        context.touched_paths.clone(),
+        config.max_output_bytes,
+    ) {
+        return Some(report);
+    }
     let phase = context.phase;
     let steps = if config.legacy_mode {
-        rust_legacy_steps(config)
+        rust_legacy_steps(config, profile.package_name.clone())
     } else if phase == VerificationPhase::Quick {
-        rust_quick_steps(config)
+        rust_quick_steps(config, profile.package_name.clone())
     } else {
-        rust_final_steps(config)
+        rust_final_steps(config, profile.package_name.clone())
     };
     Some(run_rust_steps(
-        &project_root,
+        &profile.project_root,
         context.touched_paths.clone(),
         phase,
         steps,
@@ -467,10 +738,14 @@ fn verify_rust(
 }
 
 fn finalize_rust(target: &VerificationTarget, config: &CargoVerifierConfig) -> VerificationReport {
+    let profile = build_rust_profile_for_root(&target.project_root);
+    let package_name = profile
+        .as_ref()
+        .and_then(|profile| profile.package_name.clone());
     let steps = if config.legacy_mode {
-        rust_legacy_steps(config)
+        rust_legacy_steps(config, package_name.clone())
     } else {
-        rust_final_steps(config)
+        rust_final_steps(config, package_name)
     };
     run_rust_steps(
         &target.project_root,
@@ -499,24 +774,42 @@ fn run_rust_steps(
     )
 }
 
-fn rust_quick_steps(config: &CargoVerifierConfig) -> Vec<PlannedStep> {
+fn rust_quick_steps(
+    config: &CargoVerifierConfig,
+    package_name: Option<String>,
+) -> Vec<PlannedStep> {
     if config.quick_on_write && config.rust_check {
+        let mut command = vec![
+            "cargo".to_string(),
+            "check".to_string(),
+            "--quiet".to_string(),
+            "--message-format=short".to_string(),
+        ];
+        let target_scope = if let Some(package_name) = package_name.clone() {
+            command.extend(["-p".to_string(), package_name.clone()]);
+            VerificationTargetScope::Package
+        } else {
+            VerificationTargetScope::Workspace
+        };
         vec![PlannedStep {
             label: "cargo check".to_string(),
-            command: vec![
-                "cargo".to_string(),
-                "check".to_string(),
-                "--quiet".to_string(),
-                "--message-format=short".to_string(),
-            ],
-            diagnostics: StepDiagnostics::Generic,
+            command,
+            diagnostics: StepDiagnostics::Rust {
+                step_kind: RustStepKind::Check,
+                target_scope,
+                package_name,
+            },
         }]
     } else {
         Vec::new()
     }
 }
 
-fn rust_final_steps(config: &CargoVerifierConfig) -> Vec<PlannedStep> {
+#[allow(clippy::needless_pass_by_value)] // signature matches sibling step builders
+fn rust_final_steps(
+    config: &CargoVerifierConfig,
+    package_name: Option<String>,
+) -> Vec<PlannedStep> {
     let mut steps = Vec::new();
     if config.rust_fmt {
         steps.push(PlannedStep {
@@ -527,54 +820,90 @@ fn rust_final_steps(config: &CargoVerifierConfig) -> Vec<PlannedStep> {
                 "--".to_string(),
                 "--check".to_string(),
             ],
-            diagnostics: StepDiagnostics::Generic,
+            diagnostics: StepDiagnostics::Rust {
+                step_kind: RustStepKind::FmtCheck,
+                target_scope: VerificationTargetScope::Workspace,
+                package_name: package_name.clone(),
+            },
         });
     }
     if config.rust_clippy {
+        let mut command = vec![
+            "cargo".to_string(),
+            "clippy".to_string(),
+            "--quiet".to_string(),
+            "--message-format=short".to_string(),
+        ];
+        let target_scope = if let Some(package_name) = package_name.clone() {
+            command.extend(["-p".to_string(), package_name.clone()]);
+            VerificationTargetScope::Package
+        } else {
+            VerificationTargetScope::Workspace
+        };
+        command.extend(["--".to_string(), "-D".to_string(), "warnings".to_string()]);
         steps.push(PlannedStep {
             label: "cargo clippy".to_string(),
-            command: vec![
-                "cargo".to_string(),
-                "clippy".to_string(),
-                "--quiet".to_string(),
-                "--message-format=short".to_string(),
-                "--".to_string(),
-                "-D".to_string(),
-                "warnings".to_string(),
-            ],
-            diagnostics: StepDiagnostics::Generic,
+            command,
+            diagnostics: StepDiagnostics::Rust {
+                step_kind: RustStepKind::Clippy,
+                target_scope,
+                package_name: package_name.clone(),
+            },
         });
     }
     if config.rust_test {
+        let mut command = vec![
+            "cargo".to_string(),
+            "test".to_string(),
+            "--quiet".to_string(),
+            "--no-fail-fast".to_string(),
+        ];
+        let target_scope = if let Some(package_name) = package_name.clone() {
+            command.extend(["-p".to_string(), package_name.clone()]);
+            VerificationTargetScope::Package
+        } else {
+            VerificationTargetScope::Workspace
+        };
         steps.push(PlannedStep {
             label: "cargo test".to_string(),
-            command: vec![
-                "cargo".to_string(),
-                "test".to_string(),
-                "--quiet".to_string(),
-                "--no-fail-fast".to_string(),
-            ],
-            diagnostics: StepDiagnostics::Generic,
+            command,
+            diagnostics: StepDiagnostics::Rust {
+                step_kind: RustStepKind::Test,
+                target_scope,
+                package_name: package_name.clone(),
+            },
         });
     }
     steps
 }
 
-fn rust_legacy_steps(config: &CargoVerifierConfig) -> Vec<PlannedStep> {
-    let mut steps = rust_quick_steps(config);
+fn rust_legacy_steps(
+    config: &CargoVerifierConfig,
+    package_name: Option<String>,
+) -> Vec<PlannedStep> {
+    let mut steps = rust_quick_steps(config, package_name.clone());
     if config.rust_clippy {
+        let mut command = vec![
+            "cargo".to_string(),
+            "clippy".to_string(),
+            "--quiet".to_string(),
+            "--message-format=short".to_string(),
+        ];
+        let target_scope = if let Some(package_name) = package_name.clone() {
+            command.extend(["-p".to_string(), package_name.clone()]);
+            VerificationTargetScope::Package
+        } else {
+            VerificationTargetScope::Workspace
+        };
+        command.extend(["--".to_string(), "-D".to_string(), "warnings".to_string()]);
         steps.push(PlannedStep {
             label: "cargo clippy".to_string(),
-            command: vec![
-                "cargo".to_string(),
-                "clippy".to_string(),
-                "--quiet".to_string(),
-                "--message-format=short".to_string(),
-                "--".to_string(),
-                "-D".to_string(),
-                "warnings".to_string(),
-            ],
-            diagnostics: StepDiagnostics::Generic,
+            command,
+            diagnostics: StepDiagnostics::Rust {
+                step_kind: RustStepKind::Clippy,
+                target_scope,
+                package_name: package_name.clone(),
+            },
         });
     }
     if config.rust_fmt {
@@ -586,19 +915,34 @@ fn rust_legacy_steps(config: &CargoVerifierConfig) -> Vec<PlannedStep> {
                 "--".to_string(),
                 "--check".to_string(),
             ],
-            diagnostics: StepDiagnostics::Generic,
+            diagnostics: StepDiagnostics::Rust {
+                step_kind: RustStepKind::FmtCheck,
+                target_scope: VerificationTargetScope::Workspace,
+                package_name: package_name.clone(),
+            },
         });
     }
     if config.rust_test {
+        let mut command = vec![
+            "cargo".to_string(),
+            "test".to_string(),
+            "--quiet".to_string(),
+            "--no-fail-fast".to_string(),
+        ];
+        let target_scope = if let Some(package_name) = package_name.clone() {
+            command.extend(["-p".to_string(), package_name.clone()]);
+            VerificationTargetScope::Package
+        } else {
+            VerificationTargetScope::Workspace
+        };
         steps.push(PlannedStep {
             label: "cargo test".to_string(),
-            command: vec![
-                "cargo".to_string(),
-                "test".to_string(),
-                "--quiet".to_string(),
-                "--no-fail-fast".to_string(),
-            ],
-            diagnostics: StepDiagnostics::Generic,
+            command,
+            diagnostics: StepDiagnostics::Rust {
+                step_kind: RustStepKind::Test,
+                target_scope,
+                package_name,
+            },
         });
     }
     steps
@@ -614,8 +958,8 @@ fn verify_node(
     }
     let package_json = nearest_file(path, "package.json")?;
     let project_root = package_json.parent()?.to_path_buf();
-    let package_value = match load_node_package(&package_json) {
-        Ok(value) => value,
+    let profile = match build_node_profile_for_root(&project_root) {
+        Ok(profile) => profile?,
         Err(report) => {
             return Some(node_setup_failure_report(
                 &project_root,
@@ -627,21 +971,20 @@ fn verify_node(
         }
     };
     let phase = context.phase;
-    let package_manager = detect_package_manager(&project_root);
     let steps = if config.legacy_mode {
-        node_legacy_steps(&project_root, &package_value, package_manager)
+        node_legacy_steps(&profile)
     } else if phase == VerificationPhase::Quick {
         if config.quick_on_write {
-            node_quick_steps(&project_root, &package_value, package_manager)
+            node_quick_steps(&profile)
         } else {
             Vec::new()
         }
     } else {
-        node_final_steps(&project_root, &package_value, package_manager)
+        node_final_steps(&profile)
     };
     Some(run_planned_steps(
         "node-typescript",
-        &project_root,
+        &profile.project_root,
         context.touched_paths.clone(),
         phase,
         steps,
@@ -657,9 +1000,8 @@ fn finalize_node(
     if !config.node_enabled {
         return None;
     }
-    let package_json = target.project_root.join("package.json");
-    let package_value = match load_node_package(&package_json) {
-        Ok(value) => value,
+    let profile = match build_node_profile_for_root(&target.project_root) {
+        Ok(profile) => profile?,
         Err(report) => {
             return Some(node_setup_failure_report(
                 &target.project_root,
@@ -670,18 +1012,18 @@ fn finalize_node(
             ));
         }
     };
-    let package_manager = detect_package_manager(&target.project_root);
     Some(run_planned_steps(
         "node-typescript",
         &target.project_root,
         target.touched_paths.clone(),
         VerificationPhase::Final,
-        node_final_steps(&target.project_root, &package_value, package_manager),
+        node_final_steps(&profile),
         config.node_timeout,
         config.max_output_bytes,
     ))
 }
 
+#[derive(Debug)]
 struct NodeSetupFailure {
     label: String,
     kind: VerificationFailureKind,
@@ -708,97 +1050,115 @@ fn node_setup_failure_report(
     failure: &NodeSetupFailure,
     max_output_bytes: usize,
 ) -> VerificationReport {
+    let status = if failure.kind == VerificationFailureKind::Config {
+        VerificationStatus::Failed
+    } else {
+        VerificationStatus::Unavailable
+    };
     let steps = vec![VerificationStepReport {
         adapter: "node-typescript".to_string(),
         project_root: project_root.to_path_buf(),
         label: failure.label.clone(),
         command: project_root.join("package.json").display().to_string(),
         phase,
-        status: VerificationStatus::Unavailable,
+        status,
         failure_kind: Some(failure.kind),
         duration_ms: 0,
         truncated_output: truncate_output(&failure.message, max_output_bytes),
+        step_kind: None,
+        target_scope: Some(VerificationTargetScope::Package.as_str().to_string()),
+        package_name: None,
+        package_manager: None,
+        launcher_kind: None,
     }];
-    let summary_text = render_report_summary(
-        "node-typescript",
-        project_root,
-        phase,
-        VerificationStatus::Unavailable,
-        &steps,
-    );
+    let summary_text =
+        render_report_summary("node-typescript", project_root, phase, status, &steps);
     VerificationReport {
         report_id: next_report_id(),
         phase,
         adapter_id: "node-typescript".to_string(),
         project_root: project_root.to_path_buf(),
         touched_paths,
-        status: VerificationStatus::Unavailable,
+        status,
         summary_text,
         steps,
     }
 }
 
-fn node_quick_steps(
-    root: &Path,
-    package_value: &Value,
-    manager: PackageManager,
-) -> Vec<PlannedStep> {
-    if has_script(package_value, "typecheck") {
+fn node_quick_steps(profile: &NodeProjectProfile) -> Vec<PlannedStep> {
+    if has_script(&profile.package_value, "typecheck") {
         return vec![PlannedStep {
             label: "typecheck".to_string(),
-            command: package_manager_run_script(manager, "typecheck"),
-            diagnostics: StepDiagnostics::Generic,
+            command: package_manager_run_script(profile.package_manager, "typecheck"),
+            diagnostics: StepDiagnostics::NodeTypeScript {
+                step_kind: NodeStepKind::Typecheck,
+                target_scope: VerificationTargetScope::Package,
+                package_manager: profile.package_manager,
+                package_name: profile.package_name.clone(),
+            },
         }];
     }
-    if root.join("tsconfig.json").is_file() {
+    if profile.project_root.join("tsconfig.json").is_file() {
         return vec![PlannedStep {
             label: "tsc --noEmit".to_string(),
-            command: package_manager_exec(manager, "tsc", &["--noEmit"]),
-            diagnostics: StepDiagnostics::Generic,
+            command: package_manager_exec(profile.package_manager, "tsc", &["--noEmit"]),
+            diagnostics: StepDiagnostics::NodeTypeScript {
+                step_kind: NodeStepKind::TscNoEmit,
+                target_scope: VerificationTargetScope::Package,
+                package_manager: profile.package_manager,
+                package_name: profile.package_name.clone(),
+            },
         }];
     }
     Vec::new()
 }
 
-fn node_final_steps(
-    root: &Path,
-    package_value: &Value,
-    manager: PackageManager,
-) -> Vec<PlannedStep> {
+fn node_final_steps(profile: &NodeProjectProfile) -> Vec<PlannedStep> {
     let mut steps = Vec::new();
-    if has_script(package_value, "lint") {
+    if has_script(&profile.package_value, "lint") {
         steps.push(PlannedStep {
             label: "lint".to_string(),
-            command: package_manager_run_script(manager, "lint"),
-            diagnostics: StepDiagnostics::Generic,
+            command: package_manager_run_script(profile.package_manager, "lint"),
+            diagnostics: StepDiagnostics::NodeTypeScript {
+                step_kind: NodeStepKind::Lint,
+                target_scope: VerificationTargetScope::Package,
+                package_manager: profile.package_manager,
+                package_name: profile.package_name.clone(),
+            },
         });
     } else if ESLINT_CONFIG_FILES
         .iter()
-        .any(|name| root.join(name).is_file())
+        .any(|name| profile.project_root.join(name).is_file())
     {
         steps.push(PlannedStep {
             label: "eslint .".to_string(),
-            command: package_manager_exec(manager, "eslint", &["."]),
-            diagnostics: StepDiagnostics::Generic,
+            command: package_manager_exec(profile.package_manager, "eslint", &["."]),
+            diagnostics: StepDiagnostics::NodeTypeScript {
+                step_kind: NodeStepKind::Eslint,
+                target_scope: VerificationTargetScope::Package,
+                package_manager: profile.package_manager,
+                package_name: profile.package_name.clone(),
+            },
         });
     }
-    if has_script(package_value, "test") {
+    if has_script(&profile.package_value, "test") {
         steps.push(PlannedStep {
             label: "test".to_string(),
-            command: package_manager_run_script(manager, "test"),
-            diagnostics: StepDiagnostics::Generic,
+            command: package_manager_run_script(profile.package_manager, "test"),
+            diagnostics: StepDiagnostics::NodeTypeScript {
+                step_kind: NodeStepKind::Test,
+                target_scope: VerificationTargetScope::Package,
+                package_manager: profile.package_manager,
+                package_name: profile.package_name.clone(),
+            },
         });
     }
     steps
 }
 
-fn node_legacy_steps(
-    root: &Path,
-    package_value: &Value,
-    manager: PackageManager,
-) -> Vec<PlannedStep> {
-    let mut steps = node_quick_steps(root, package_value, manager);
-    steps.extend(node_final_steps(root, package_value, manager));
+fn node_legacy_steps(profile: &NodeProjectProfile) -> Vec<PlannedStep> {
+    let mut steps = node_quick_steps(profile);
+    steps.extend(node_final_steps(profile));
     steps
 }
 
@@ -906,6 +1266,11 @@ fn python_config_failure_report(
         failure_kind: Some(VerificationFailureKind::Config),
         duration_ms: 0,
         truncated_output: truncate_output(error, max_output_bytes),
+        step_kind: None,
+        target_scope: Some(VerificationTargetScope::Project.as_str().to_string()),
+        package_name: None,
+        package_manager: None,
+        launcher_kind: Some(profile.launcher_kind.as_str().to_string()),
     }];
     let summary_text = render_report_summary(
         "python",
@@ -1039,6 +1404,14 @@ fn python_step(
         diagnostics: StepDiagnostics::Python {
             launcher_kind: profile.launcher_kind,
             step_kind,
+            target_scope: if matches!(
+                step_kind,
+                PythonStepKind::Pytest | PythonStepKind::RuffCheck
+            ) {
+                VerificationTargetScope::Project
+            } else {
+                VerificationTargetScope::FileSet
+            },
         },
     }
 }
@@ -1056,6 +1429,7 @@ fn dedupe_steps(steps: &mut Vec<PlannedStep>) {
     });
 }
 
+#[allow(clippy::too_many_lines)]
 fn run_planned_steps(
     adapter_id: &str,
     project_root: &Path,
@@ -1085,6 +1459,11 @@ fn run_planned_steps(
                 failure_kind: None,
                 duration_ms: 0,
                 truncated_output: String::new(),
+                step_kind: step.diagnostics.step_kind(),
+                target_scope: step.diagnostics.target_scope(),
+                package_name: step.diagnostics.package_name(),
+                package_manager: step.diagnostics.package_manager(),
+                launcher_kind: step.diagnostics.launcher_kind(),
             });
             continue;
         }
@@ -1101,6 +1480,11 @@ fn run_planned_steps(
                 failure_kind: None,
                 duration_ms,
                 truncated_output: body,
+                step_kind: step.diagnostics.step_kind(),
+                target_scope: step.diagnostics.target_scope(),
+                package_name: step.diagnostics.package_name(),
+                package_manager: step.diagnostics.package_manager(),
+                launcher_kind: step.diagnostics.launcher_kind(),
             }),
             StepOutcome::Failed {
                 body,
@@ -1119,6 +1503,11 @@ fn run_planned_steps(
                     failure_kind,
                     duration_ms,
                     truncated_output: body,
+                    step_kind: step.diagnostics.step_kind(),
+                    target_scope: step.diagnostics.target_scope(),
+                    package_name: step.diagnostics.package_name(),
+                    package_manager: step.diagnostics.package_manager(),
+                    launcher_kind: step.diagnostics.launcher_kind(),
                 });
             }
             StepOutcome::Unavailable {
@@ -1138,6 +1527,11 @@ fn run_planned_steps(
                     failure_kind,
                     duration_ms,
                     truncated_output: message,
+                    step_kind: step.diagnostics.step_kind(),
+                    target_scope: step.diagnostics.target_scope(),
+                    package_name: step.diagnostics.package_name(),
+                    package_manager: step.diagnostics.package_manager(),
+                    launcher_kind: step.diagnostics.launcher_kind(),
                 });
             }
         }
@@ -1164,10 +1558,6 @@ fn render_report_summary(
     status: VerificationStatus,
     steps: &[VerificationStepReport],
 ) -> String {
-    if adapter_id == "python" {
-        return render_python_report_summary(adapter_id, project_root, phase, status, steps);
-    }
-
     let mut summary = format!(
         "[verifier:{}:{}] {} ({})",
         phase.as_str(),
@@ -1179,60 +1569,29 @@ fn render_report_summary(
         summary.push_str("\n[verifier] no verification steps were planned");
         return summary;
     }
-    for step in steps {
+    let primary_idx = steps
+        .iter()
+        .position(|step| !step.status.is_success())
+        .unwrap_or(0);
+    for (idx, step) in steps.iter().enumerate() {
         let label = match step.status {
             VerificationStatus::Passed => "ok",
             VerificationStatus::Failed => "FAIL",
             VerificationStatus::Skipped => "skipped",
             VerificationStatus::Unavailable => "unavailable",
         };
-        let _ = writeln!(summary, "\n[verifier] {}: {label}", step.label);
-        if !step.truncated_output.trim().is_empty() {
+        let failure_suffix = step
+            .failure_kind
+            .map(|kind| format!(" ({})", kind.as_str()))
+            .unwrap_or_default();
+        let _ = writeln!(
+            summary,
+            "\n[verifier] {}: {label}{failure_suffix}",
+            step.label
+        );
+        if idx == primary_idx && !step.truncated_output.trim().is_empty() {
             summary.push_str(&step.truncated_output);
         }
-    }
-    summary.trim_end().to_string()
-}
-
-fn render_python_report_summary(
-    adapter_id: &str,
-    project_root: &Path,
-    phase: VerificationPhase,
-    status: VerificationStatus,
-    steps: &[VerificationStepReport],
-) -> String {
-    let mut summary = format!(
-        "[verifier:{}:{}] {} ({})",
-        phase.as_str(),
-        adapter_id,
-        status.as_str(),
-        project_root.display()
-    );
-    if steps.is_empty() {
-        summary.push_str("\n[verifier] no verification steps were planned");
-        return summary;
-    }
-    let primary = steps
-        .iter()
-        .find(|step| !step.status.is_success())
-        .unwrap_or(&steps[0]);
-    let label = match primary.status {
-        VerificationStatus::Passed => "ok",
-        VerificationStatus::Failed => "FAIL",
-        VerificationStatus::Skipped => "skipped",
-        VerificationStatus::Unavailable => "unavailable",
-    };
-    let failure_suffix = primary
-        .failure_kind
-        .map(|kind| format!(" ({})", kind.as_str()))
-        .unwrap_or_default();
-    let _ = writeln!(
-        summary,
-        "\n[verifier] {}: {label}{failure_suffix}",
-        primary.label
-    );
-    if !primary.truncated_output.trim().is_empty() {
-        summary.push_str(&primary.truncated_output);
     }
     summary.trim_end().to_string()
 }
@@ -1299,6 +1658,101 @@ fn detect_package_manager(root: &Path) -> PackageManager {
     }
 }
 
+fn build_rust_profile_for_path(path: &Path) -> Option<RustProjectProfile> {
+    let manifest = nearest_file(path, "Cargo.toml")?;
+    build_rust_profile_from_manifest(&manifest)
+}
+
+fn build_rust_profile_for_root(root: &Path) -> Option<RustProjectProfile> {
+    let manifest = normalize_local_path(root)?.join("Cargo.toml");
+    build_rust_profile_from_manifest(&manifest)
+}
+
+fn build_rust_profile_from_manifest(manifest_path: &Path) -> Option<RustProjectProfile> {
+    let manifest_path = normalize_local_path(manifest_path)?;
+    let project_root = manifest_path.parent()?.to_path_buf();
+    let (manifest_parsed, manifest_value, manifest_parse_error) =
+        parse_optional_toml_file(&manifest_path, "Cargo.toml");
+    let package_name = manifest_value
+        .as_ref()
+        .and_then(|value| toml_value_at(value, &["package", "name"]))
+        .and_then(TomlValue::as_str)
+        .map(ToOwned::to_owned);
+    Some(RustProjectProfile {
+        project_root,
+        manifest_path,
+        package_name,
+        manifest_parsed,
+        manifest_parse_error,
+    })
+}
+
+fn rust_config_failure_report(
+    profile: &RustProjectProfile,
+    phase: VerificationPhase,
+    touched_paths: Vec<PathBuf>,
+    max_output_bytes: usize,
+) -> Option<VerificationReport> {
+    if profile.manifest_parsed {
+        return None;
+    }
+    let error = profile.manifest_parse_error.as_ref()?;
+    let steps = vec![VerificationStepReport {
+        adapter: "rust-cargo".to_string(),
+        project_root: profile.project_root.clone(),
+        label: "Cargo.toml parse".to_string(),
+        command: profile.manifest_path.display().to_string(),
+        phase,
+        status: VerificationStatus::Failed,
+        failure_kind: Some(VerificationFailureKind::Config),
+        duration_ms: 0,
+        truncated_output: truncate_output(error, max_output_bytes),
+        step_kind: None,
+        target_scope: Some(VerificationTargetScope::Workspace.as_str().to_string()),
+        package_name: profile.package_name.clone(),
+        package_manager: None,
+        launcher_kind: None,
+    }];
+    let summary_text = render_report_summary(
+        "rust-cargo",
+        &profile.project_root,
+        phase,
+        VerificationStatus::Failed,
+        &steps,
+    );
+    Some(VerificationReport {
+        report_id: next_report_id(),
+        phase,
+        adapter_id: "rust-cargo".to_string(),
+        project_root: profile.project_root.clone(),
+        touched_paths,
+        status: VerificationStatus::Failed,
+        summary_text,
+        steps,
+    })
+}
+
+fn build_node_profile_for_root(
+    root: &Path,
+) -> Result<Option<NodeProjectProfile>, NodeSetupFailure> {
+    let Some(project_root) = normalize_local_path(root) else {
+        return Ok(None);
+    };
+    let package_json_path = project_root.join("package.json");
+    let package_value = load_node_package(&package_json_path)?;
+    let package_name = package_value
+        .get("name")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    Ok(Some(NodeProjectProfile {
+        package_manager: detect_package_manager(&project_root),
+        package_json_path,
+        project_root,
+        package_value,
+        package_name,
+    }))
+}
+
 fn build_python_profile_for_path(path: &Path) -> Option<PythonProjectProfile> {
     let project_root = nearest_python_root(path)?;
     build_python_profile_for_root(&project_root)
@@ -1332,6 +1786,13 @@ fn build_python_profile_for_root(root: &Path) -> Option<PythonProjectProfile> {
 }
 
 fn parse_optional_pyproject(path: &Path) -> (bool, Option<TomlValue>, Option<String>) {
+    parse_optional_toml_file(path, "pyproject.toml")
+}
+
+fn parse_optional_toml_file(
+    path: &Path,
+    display_name: &str,
+) -> (bool, Option<TomlValue>, Option<String>) {
     if !path.is_file() {
         return (true, None, None);
     }
@@ -1341,13 +1802,13 @@ fn parse_optional_pyproject(path: &Path) -> (bool, Option<TomlValue>, Option<Str
             Err(error) => (
                 false,
                 None,
-                Some(format!("failed to parse pyproject.toml: {error}")),
+                Some(format!("failed to parse {display_name}: {error}")),
             ),
         },
         Err(error) => (
             false,
             None,
-            Some(format!("failed to read pyproject.toml: {error}")),
+            Some(format!("failed to read {display_name}: {error}")),
         ),
     }
 }
@@ -1566,6 +2027,38 @@ fn file_contains(path: impl AsRef<Path>, needle: &str) -> bool {
     fs::read_to_string(path.as_ref()).is_ok_and(|contents| contents.contains(needle))
 }
 
+/// Walks ancestors of `start` and returns the adapter whose marker file is found first
+/// (closest wins). Explicit markers per spec Fase 5: Cargo.toml → Rust, package.json → Node,
+/// any `PYTHON_ROOT_MARKERS` entry → Python.
+fn detect_adapter_by_marker(start: &Path) -> Option<Adapter> {
+    let start = if start.is_absolute() {
+        start.to_path_buf()
+    } else {
+        std::env::current_dir().ok()?.join(start)
+    };
+    let mut cursor = if start.is_dir() {
+        start
+    } else {
+        start.parent()?.to_path_buf()
+    };
+    loop {
+        if cursor.join("Cargo.toml").is_file() {
+            return Some(Adapter::Rust);
+        }
+        if cursor.join("package.json").is_file() {
+            return Some(Adapter::NodeTypeScript);
+        }
+        for marker in PYTHON_ROOT_MARKERS {
+            if cursor.join(marker).is_file() {
+                return Some(Adapter::Python);
+            }
+        }
+        if !cursor.pop() {
+            return None;
+        }
+    }
+}
+
 fn nearest_file(start: &Path, file_name: &str) -> Option<PathBuf> {
     let start = if start.is_absolute() {
         start.to_path_buf()
@@ -1607,30 +2100,162 @@ fn nearest_python_root(start: &Path) -> Option<PathBuf> {
     }
 }
 
+#[allow(clippy::unnecessary_wraps)] // feeds Option<VerificationFailureKind> field
 fn classify_step_failure(step: &PlannedStep, body: &str) -> Option<VerificationFailureKind> {
     match step.diagnostics {
-        StepDiagnostics::Generic => None,
+        StepDiagnostics::Rust {
+            step_kind,
+            target_scope: _,
+            package_name: _,
+        } => Some(classify_rust_failure_kind(step_kind, body)),
+        StepDiagnostics::NodeTypeScript {
+            step_kind,
+            target_scope: _,
+            package_manager,
+            package_name: _,
+        } => Some(classify_node_failure_kind(step_kind, package_manager, body)),
         StepDiagnostics::Python {
             launcher_kind,
             step_kind,
+            target_scope: _,
         } => Some(classify_python_failure_kind(launcher_kind, step_kind, body)),
     }
 }
 
+#[allow(clippy::unnecessary_wraps)] // feeds Option<VerificationFailureKind> field
 fn classify_step_timeout(step: &PlannedStep) -> Option<VerificationFailureKind> {
     match step.diagnostics {
-        StepDiagnostics::Generic => None,
-        StepDiagnostics::Python { .. } => Some(VerificationFailureKind::Timeout),
+        StepDiagnostics::Rust { .. }
+        | StepDiagnostics::NodeTypeScript { .. }
+        | StepDiagnostics::Python { .. } => Some(VerificationFailureKind::Timeout),
     }
 }
 
+#[allow(clippy::unnecessary_wraps)] // feeds Option<VerificationFailureKind> field
 fn classify_step_unavailable(step: &PlannedStep, message: &str) -> Option<VerificationFailureKind> {
     match step.diagnostics {
-        StepDiagnostics::Generic => None,
+        StepDiagnostics::Rust { step_kind, .. } => {
+            Some(classify_rust_unavailable_kind(step_kind, message))
+        }
+        StepDiagnostics::NodeTypeScript {
+            step_kind,
+            package_manager,
+            ..
+        } => Some(classify_node_unavailable_kind(
+            step_kind,
+            package_manager,
+            message,
+        )),
         StepDiagnostics::Python { launcher_kind, .. } => {
             Some(classify_python_unavailable_kind(launcher_kind, message))
         }
     }
+}
+
+fn classify_rust_failure_kind(step_kind: RustStepKind, body: &str) -> VerificationFailureKind {
+    let lower = body.to_ascii_lowercase();
+    if lower.contains("failed to parse manifest")
+        || lower.contains("could not parse manifest")
+        || lower.contains("invalid table header")
+        || (lower.contains("cargo.toml") && lower.contains("parse"))
+    {
+        return VerificationFailureKind::Config;
+    }
+    if is_rust_tool_unavailable(step_kind, &lower) {
+        return VerificationFailureKind::ToolUnavailable;
+    }
+    if lower.contains("toolchain")
+        || lower.contains("rustup")
+        || lower.contains("linker")
+        || lower.contains("target may not be installed")
+        || lower.contains("failed to run custom build command")
+    {
+        return VerificationFailureKind::Environment;
+    }
+    VerificationFailureKind::Code
+}
+
+fn classify_rust_unavailable_kind(
+    step_kind: RustStepKind,
+    message: &str,
+) -> VerificationFailureKind {
+    let lower = message.to_ascii_lowercase();
+    if is_rust_tool_unavailable(step_kind, &lower) || lower.contains("cargo") {
+        VerificationFailureKind::ToolUnavailable
+    } else {
+        VerificationFailureKind::Environment
+    }
+}
+
+fn is_rust_tool_unavailable(step_kind: RustStepKind, lower: &str) -> bool {
+    let tool_name = match step_kind {
+        RustStepKind::Check | RustStepKind::Clippy | RustStepKind::Test => "cargo",
+        RustStepKind::FmtCheck => "rustfmt",
+    };
+    lower.contains("no such subcommand")
+        || lower.contains("command not found")
+        || lower.contains("not recognized as an internal or external command")
+        || lower.contains("is not installed")
+        || lower.contains(tool_name) && lower.contains("not found")
+}
+
+fn classify_node_failure_kind(
+    step_kind: NodeStepKind,
+    package_manager: PackageManager,
+    body: &str,
+) -> VerificationFailureKind {
+    let lower = body.to_ascii_lowercase();
+    if lower.contains("tsconfig")
+        && (lower.contains("parse") || lower.contains("unknown compiler option"))
+    {
+        return VerificationFailureKind::Config;
+    }
+    if lower.contains("eslint") && lower.contains("configuration") {
+        return VerificationFailureKind::Config;
+    }
+    if is_node_tool_unavailable(step_kind, package_manager, &lower) {
+        return VerificationFailureKind::ToolUnavailable;
+    }
+    if lower.contains("node_modules")
+        || lower.contains("lockfile")
+        || lower.contains("package manager")
+        || lower.contains("missing script")
+    {
+        return VerificationFailureKind::Environment;
+    }
+    VerificationFailureKind::Code
+}
+
+fn classify_node_unavailable_kind(
+    step_kind: NodeStepKind,
+    package_manager: PackageManager,
+    message: &str,
+) -> VerificationFailureKind {
+    let lower = message.to_ascii_lowercase();
+    if is_node_tool_unavailable(step_kind, package_manager, &lower) {
+        VerificationFailureKind::ToolUnavailable
+    } else {
+        VerificationFailureKind::Environment
+    }
+}
+
+fn is_node_tool_unavailable(
+    step_kind: NodeStepKind,
+    package_manager: PackageManager,
+    lower: &str,
+) -> bool {
+    let tool_name = match step_kind {
+        NodeStepKind::Typecheck => "typecheck",
+        NodeStepKind::TscNoEmit => "tsc",
+        NodeStepKind::Lint => "lint",
+        NodeStepKind::Eslint => "eslint",
+        NodeStepKind::Test => "test",
+    };
+    lower.contains("command not found")
+        || lower.contains("not recognized as an internal or external command")
+        || lower.contains("could not determine executable to run")
+        || lower.contains(package_manager.as_str()) && lower.contains("not found")
+        || lower.contains(tool_name) && lower.contains("not found")
 }
 
 fn classify_python_failure_kind(
@@ -1718,7 +2343,7 @@ fn run_step(
     timeout: Duration,
     max_output_bytes: usize,
 ) -> StepOutcome {
-    let mut command = Command::new(&step.command[0]);
+    let mut command = spawnable_command(&step.command[0]);
     command.current_dir(cwd);
     command.stdin(std::process::Stdio::null());
     command.stdout(std::process::Stdio::piped());
@@ -1780,6 +2405,95 @@ fn run_step(
             }
         }
     }
+}
+
+fn spawnable_command(program: &str) -> Command {
+    #[cfg(windows)]
+    {
+        if let Some(resolved) = resolve_windows_program(program) {
+            if uses_cmd_wrapper(&resolved) {
+                let mut command = Command::new("cmd");
+                command.arg("/C").arg(resolved);
+                return command;
+            }
+            return Command::new(resolved);
+        }
+    }
+
+    Command::new(program)
+}
+
+#[cfg(windows)]
+fn resolve_windows_program(program: &str) -> Option<PathBuf> {
+    let path = Path::new(program);
+    if path.components().count() > 1 || path.is_absolute() {
+        return resolve_windows_path_candidate(path);
+    }
+
+    let path_entries = std::env::var_os("PATH")
+        .into_iter()
+        .flat_map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    for entry in path_entries {
+        let candidate = entry.join(program);
+        if let Some(resolved) = resolve_windows_path_candidate(&candidate) {
+            return Some(resolved);
+        }
+    }
+    None
+}
+
+#[cfg(windows)]
+fn resolve_windows_path_candidate(candidate: &Path) -> Option<PathBuf> {
+    if candidate.is_file() {
+        return Some(candidate.to_path_buf());
+    }
+    if candidate.extension().is_some() {
+        return None;
+    }
+
+    for extension in windows_path_extensions() {
+        let trimmed = extension.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let suffix = trimmed.strip_prefix('.').unwrap_or(trimmed);
+        let path = candidate.with_extension(suffix);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    None
+}
+
+#[cfg(windows)]
+fn windows_path_extensions() -> Vec<String> {
+    std::env::var("PATHEXT")
+        .ok()
+        .map(|value| {
+            value
+                .split(';')
+                .map(str::trim)
+                .filter(|entry| !entry.is_empty())
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .filter(|values| !values.is_empty())
+        .unwrap_or_else(|| {
+            vec![
+                ".COM".to_string(),
+                ".EXE".to_string(),
+                ".BAT".to_string(),
+                ".CMD".to_string(),
+            ]
+        })
+}
+
+#[cfg(windows)]
+fn uses_cmd_wrapper(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat"))
 }
 
 fn duration_millis_u64(duration: Duration) -> u64 {
@@ -2205,9 +2919,310 @@ addopts = "-q"
                 diagnostics: StepDiagnostics::Python {
                     launcher_kind: PythonLauncherKind::Global,
                     step_kind: PythonStepKind::Pytest,
+                    target_scope: VerificationTargetScope::Project,
                 },
             }),
             Some(VerificationFailureKind::Timeout)
         );
+    }
+
+    #[test]
+    fn rust_profile_extracts_package_name_from_nearest_manifest() {
+        let root = temp_dir("rust-profile");
+        let crate_dir = root.join("crates").join("demo");
+        fs::create_dir_all(crate_dir.join("src")).expect("crate dir should create");
+        fs::write(
+            crate_dir.join("Cargo.toml"),
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("manifest should write");
+        fs::write(crate_dir.join("src").join("lib.rs"), "pub fn demo() {}\n")
+            .expect("lib should write");
+
+        let profile = build_rust_profile_for_path(&crate_dir.join("src").join("lib.rs"))
+            .expect("profile should resolve");
+
+        assert_eq!(profile.project_root, crate_dir);
+        assert_eq!(profile.package_name.as_deref(), Some("demo"));
+        assert!(profile.manifest_parsed);
+
+        fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[test]
+    fn rust_quick_steps_scope_to_package_when_package_name_is_known() {
+        let steps = rust_quick_steps(&CargoVerifierConfig::default(), Some("demo".to_string()));
+
+        assert_eq!(steps.len(), 1);
+        assert_eq!(
+            steps[0].command,
+            vec![
+                "cargo".to_string(),
+                "check".to_string(),
+                "--quiet".to_string(),
+                "--message-format=short".to_string(),
+                "-p".to_string(),
+                "demo".to_string(),
+            ]
+        );
+        assert_eq!(
+            steps[0].diagnostics,
+            StepDiagnostics::Rust {
+                step_kind: RustStepKind::Check,
+                target_scope: VerificationTargetScope::Package,
+                package_name: Some("demo".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn node_profile_resolves_nearest_package_and_package_manager() {
+        let root = temp_dir("node-profile");
+        let package_root = root.join("packages").join("web");
+        fs::create_dir_all(&package_root).expect("package root should create");
+        fs::write(
+            package_root.join("package.json"),
+            r#"{
+  "name": "@demo/web",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint ."
+  }
+}"#,
+        )
+        .expect("package should write");
+        fs::write(
+            package_root.join("pnpm-lock.yaml"),
+            "lockfileVersion: '9.0'\n",
+        )
+        .expect("lockfile should write");
+
+        let profile = build_node_profile_for_root(&package_root)
+            .expect("profile should not error")
+            .expect("profile should exist");
+
+        assert_eq!(profile.project_root, package_root);
+        assert_eq!(profile.package_name.as_deref(), Some("@demo/web"));
+        assert_eq!(profile.package_manager, PackageManager::Pnpm);
+
+        fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[test]
+    fn node_quick_steps_prefer_package_scripts_and_carry_metadata() {
+        let profile = NodeProjectProfile {
+            project_root: PathBuf::from("/workspace/packages/web"),
+            package_json_path: PathBuf::from("/workspace/packages/web/package.json"),
+            package_value: serde_json::json!({
+                "name": "@demo/web",
+                "scripts": {
+                    "typecheck": "tsc --noEmit"
+                }
+            }),
+            package_manager: PackageManager::Pnpm,
+            package_name: Some("@demo/web".to_string()),
+        };
+
+        let steps = node_quick_steps(&profile);
+
+        assert_eq!(steps.len(), 1);
+        assert_eq!(
+            steps[0].command,
+            vec![
+                "pnpm".to_string(),
+                "run".to_string(),
+                "typecheck".to_string(),
+            ]
+        );
+        assert_eq!(
+            steps[0].diagnostics,
+            StepDiagnostics::NodeTypeScript {
+                step_kind: NodeStepKind::Typecheck,
+                target_scope: VerificationTargetScope::Package,
+                package_manager: PackageManager::Pnpm,
+                package_name: Some("@demo/web".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn classify_rust_failures_distinguishes_config_environment_and_tools() {
+        assert_eq!(
+            classify_rust_failure_kind(
+                RustStepKind::Check,
+                "failed to parse manifest at Cargo.toml"
+            ),
+            VerificationFailureKind::Config
+        );
+        assert_eq!(
+            classify_rust_failure_kind(
+                RustStepKind::Check,
+                "error: linker `cc` not found while building crate",
+            ),
+            VerificationFailureKind::Environment
+        );
+        assert_eq!(
+            classify_rust_failure_kind(RustStepKind::Clippy, "error: no such subcommand: `clippy`",),
+            VerificationFailureKind::ToolUnavailable
+        );
+        assert_eq!(
+            classify_rust_failure_kind(RustStepKind::Check, "error[E0308]: mismatched types"),
+            VerificationFailureKind::Code
+        );
+    }
+
+    #[test]
+    fn classify_node_failures_distinguishes_config_environment_and_tools() {
+        assert_eq!(
+            classify_node_failure_kind(
+                NodeStepKind::TscNoEmit,
+                PackageManager::Npm,
+                "tsconfig parse error: unknown compiler option",
+            ),
+            VerificationFailureKind::Config
+        );
+        assert_eq!(
+            classify_node_failure_kind(
+                NodeStepKind::Typecheck,
+                PackageManager::Pnpm,
+                "pnpm package manager could not install because lockfile is missing",
+            ),
+            VerificationFailureKind::Environment
+        );
+        assert_eq!(
+            classify_node_failure_kind(
+                NodeStepKind::Eslint,
+                PackageManager::Npm,
+                "eslint not found",
+            ),
+            VerificationFailureKind::ToolUnavailable
+        );
+        assert_eq!(
+            classify_node_failure_kind(
+                NodeStepKind::TscNoEmit,
+                PackageManager::Npm,
+                "src/index.ts(1,7): error TS2322: Type 'string' is not assignable",
+            ),
+            VerificationFailureKind::Code
+        );
+    }
+
+    #[test]
+    fn cargo_verifier_auto_mode_skips_empty_step_reports() {
+        let root = temp_dir("auto-node-empty");
+        fs::write(
+            root.join("package.json"),
+            r#"{"name":"demo-node","scripts":{}}"#,
+        )
+        .expect("package json should write");
+        let source = root.join("index.ts");
+        fs::write(&source, "export const value = 1;\n").expect("source should write");
+
+        let verifier = CargoVerifier::new(CargoVerifierConfig {
+            legacy_mode: false,
+            auto_mode: true,
+            quick_on_write: true,
+            final_gate: true,
+            max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
+            rust_check: true,
+            rust_clippy: true,
+            rust_fmt: true,
+            rust_test: true,
+            rust_timeout: Duration::from_secs(1),
+            node_enabled: true,
+            node_timeout: Duration::from_secs(1),
+            python_enabled: false,
+            python_timeout: Duration::from_secs(1),
+        });
+        let context = VerificationContext {
+            phase: VerificationPhase::Quick,
+            workspace_root: Some(root.clone()),
+            tool_name: "edit_file".to_string(),
+            tool_input: format!(r#"{{"file_path":"{}"}}"#, source.display()),
+            touched_paths: vec![source],
+            mutation_sequence: 1,
+        };
+
+        let reports = verifier.quick_verify(&context);
+
+        assert!(
+            reports.is_empty(),
+            "auto mode should skip empty-step reports"
+        );
+
+        fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[test]
+    fn detect_adapter_by_marker_prefers_closest_ancestor() {
+        let root = temp_dir("auto-marker-closest");
+        // Outer repo marker is package.json; inner package has Cargo.toml closer to file.
+        fs::write(root.join("package.json"), r#"{"name":"outer"}"#)
+            .expect("outer package.json should write");
+        let inner = root.join("crate-a");
+        fs::create_dir_all(&inner).expect("inner dir should create");
+        fs::write(
+            inner.join("Cargo.toml"),
+            "[package]\nname=\"a\"\nversion=\"0.1.0\"\n",
+        )
+        .expect("inner Cargo.toml should write");
+        let source = inner.join("src").join("lib.rs");
+        fs::create_dir_all(source.parent().unwrap()).expect("src dir");
+        fs::write(&source, "pub fn x() {}\n").expect("src");
+
+        let detected = detect_adapter_by_marker(&source).expect("adapter should resolve");
+        assert_eq!(detected, Adapter::Rust);
+
+        fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[test]
+    fn detect_adapter_by_marker_returns_none_without_markers() {
+        let root = temp_dir("auto-marker-none");
+        let source = root.join("note.txt");
+        fs::write(&source, "plain\n").expect("note should write");
+
+        assert!(detect_adapter_by_marker(&source).is_none());
+
+        fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[test]
+    fn auto_mode_without_marker_returns_no_reports() {
+        let root = temp_dir("auto-no-marker");
+        let source = root.join("random.txt");
+        fs::write(&source, "nope\n").expect("source should write");
+
+        let verifier = CargoVerifier::new(CargoVerifierConfig {
+            legacy_mode: false,
+            auto_mode: true,
+            quick_on_write: true,
+            final_gate: true,
+            max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
+            rust_check: true,
+            rust_clippy: true,
+            rust_fmt: true,
+            rust_test: true,
+            rust_timeout: Duration::from_secs(1),
+            node_enabled: true,
+            node_timeout: Duration::from_secs(1),
+            python_enabled: true,
+            python_timeout: Duration::from_secs(1),
+        });
+        let context = VerificationContext {
+            phase: VerificationPhase::Quick,
+            workspace_root: Some(root.clone()),
+            tool_name: "edit_file".to_string(),
+            tool_input: format!(r#"{{"file_path":"{}"}}"#, source.display()),
+            touched_paths: vec![source],
+            mutation_sequence: 1,
+        };
+
+        assert!(
+            verifier.quick_verify(&context).is_empty(),
+            "auto mode without marker should return no reports"
+        );
+
+        fs::remove_dir_all(root).expect("temp dir should clean up");
     }
 }

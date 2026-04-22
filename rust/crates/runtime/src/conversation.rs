@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{Display, Formatter};
+use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 
 use serde_json::{Map, Value};
@@ -24,6 +25,7 @@ const MAX_FINAL_GATE_ATTEMPTS: u32 = 5;
 
 const DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD: u32 = 100_000;
 const AUTO_COMPACTION_THRESHOLD_ENV_VAR: &str = "CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS";
+const VERIFIER_REPORT_STAGE_ENV_VAR: &str = "CLAUDE_CODE_VERIFIER_REPORT_STAGE";
 
 /// Fully assembled request payload sent to the upstream model client.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -384,9 +386,13 @@ where
     fn persist_verification_report(
         &mut self,
         report: &VerificationReport,
+        report_mode: &str,
     ) -> Result<(), RuntimeError> {
         self.session
-            .push_message(ConversationMessage::verification_report(report))
+            .push_message(ConversationMessage::verification_report(
+                report,
+                Some(report_mode),
+            ))
             .map_err(|error| RuntimeError::new(error.to_string()))
     }
 
@@ -474,6 +480,11 @@ where
                 failure_kind: Some(VerificationFailureKind::ToolUnavailable),
                 duration_ms: 0,
                 truncated_output: reason.to_string(),
+                step_kind: None,
+                target_scope: None,
+                package_name: None,
+                package_manager: None,
+                launcher_kind: None,
             }],
         }
     }
@@ -498,6 +509,7 @@ where
         }
 
         self.record_turn_started(&user_input);
+        let turn_started_at = std::time::Instant::now();
         self.session
             .push_user_text(user_input)
             .map_err(|error| RuntimeError::new(error.to_string()))?;
@@ -623,13 +635,16 @@ where
                             ledger_entry.last_final_verified_sequence =
                                 Some(ledger_entry.last_mutation_sequence);
                         }
+                        let report_mode = verification_report_mode(&report);
                         self.record_verifier_ran(
                             iterations,
                             &format!("final_gate:{}", entry.adapter_id),
-                            false,
+                            &report,
+                            entry.last_mutation_sequence,
+                            &report_mode,
                         );
                         verification_gate.report_ids.push(report.report_id.clone());
-                        self.persist_verification_report(&report)?;
+                        self.persist_verification_report(&report, &report_mode)?;
                         gate_reports.push(report);
                         continue;
                     }
@@ -650,13 +665,16 @@ where
                     } else {
                         Self::make_final_gate_reminder(&entry)
                     };
+                    let report_mode = verification_report_mode(&report);
                     self.record_verifier_ran(
                         iterations,
                         &format!("final_gate:{}", entry.adapter_id),
-                        report.is_success(),
+                        &report,
+                        entry.last_mutation_sequence,
+                        &report_mode,
                     );
                     verification_gate.report_ids.push(report.report_id.clone());
-                    self.persist_verification_report(&report)?;
+                    self.persist_verification_report(&report, &report_mode)?;
                     gate_reports.push(report);
                 }
 
@@ -767,10 +785,13 @@ where
                                 mutation_sequence,
                             );
                             for report in reports {
+                                let report_mode = verification_report_mode(&report);
                                 self.record_verifier_ran(
                                     iterations,
                                     &tool_name,
-                                    report.is_success(),
+                                    &report,
+                                    mutation_sequence,
+                                    &report_mode,
                                 );
                                 output = prepend_verifier_summary(&report.short_summary(), output);
                                 if !report.is_success() {
@@ -817,7 +838,8 @@ where
                 self.record_tool_finished(iterations, &result_message);
                 tool_results.push(result_message);
                 for report in pending_verification_reports {
-                    self.persist_verification_report(&report)?;
+                    let report_mode = verification_report_mode(&report);
+                    self.persist_verification_report(&report, &report_mode)?;
                     verification_reports.push(report);
                 }
             }
@@ -835,7 +857,10 @@ where
             usage: self.usage_tracker.cumulative_usage(),
             auto_compaction,
         };
-        self.record_turn_completed(&summary);
+        self.record_turn_completed(
+            &summary,
+            u64::try_from(turn_started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+        );
 
         Ok(summary)
     }
@@ -974,7 +999,7 @@ where
         session_tracer.record("tool_execution_finished", attributes);
     }
 
-    fn record_turn_completed(&self, summary: &TurnSummary) {
+    fn record_turn_completed(&self, summary: &TurnSummary, turn_latency_ms: u64) {
         let Some(session_tracer) = &self.session_tracer else {
             return;
         };
@@ -1008,10 +1033,22 @@ where
             "prompt_cache_events".to_string(),
             Value::from(summary.prompt_cache_events.len() as u64),
         );
+        attributes.insert("turn_latency_ms".to_string(), Value::from(turn_latency_ms));
+        attributes.insert(
+            "tokens_total".to_string(),
+            Value::from(u64::from(summary.usage.total_tokens())),
+        );
         session_tracer.record("turn_completed", attributes);
     }
 
-    fn record_verifier_ran(&self, iteration: usize, tool_name: &str, passed: bool) {
+    fn record_verifier_ran(
+        &self,
+        iteration: usize,
+        tool_name: &str,
+        report: &VerificationReport,
+        mutation_sequence: u64,
+        report_mode: &str,
+    ) {
         let Some(session_tracer) = &self.session_tracer else {
             return;
         };
@@ -1022,7 +1059,41 @@ where
             "tool_name".to_string(),
             Value::String(tool_name.to_string()),
         );
-        attributes.insert("passed".to_string(), Value::Bool(passed));
+        attributes.insert("passed".to_string(), Value::Bool(report.is_success()));
+        attributes.insert(
+            "adapter_id".to_string(),
+            Value::String(report.adapter_id.clone()),
+        );
+        attributes.insert(
+            "phase".to_string(),
+            Value::String(report.phase.as_str().to_string()),
+        );
+        attributes.insert(
+            "mutation_sequence".to_string(),
+            Value::from(mutation_sequence),
+        );
+        attributes.insert(
+            "report_mode".to_string(),
+            Value::String(report_mode.to_string()),
+        );
+        if let Some(primary_step) = report.primary_step() {
+            attributes.insert(
+                "duration_ms".to_string(),
+                Value::from(primary_step.duration_ms),
+            );
+            if let Some(target_scope) = &primary_step.target_scope {
+                attributes.insert(
+                    "target_scope".to_string(),
+                    Value::String(target_scope.clone()),
+                );
+            }
+            if let Some(failure_kind) = primary_step.failure_kind {
+                attributes.insert(
+                    "failure_kind".to_string(),
+                    Value::String(failure_kind.as_str().to_string()),
+                );
+            }
+        }
         session_tracer.record("verifier_ran", attributes);
     }
 
@@ -1054,6 +1125,26 @@ fn parse_auto_compaction_threshold(value: Option<&str>) -> u32 {
         .and_then(|raw| raw.trim().parse::<u32>().ok())
         .filter(|threshold| *threshold > 0)
         .unwrap_or(DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD)
+}
+
+fn verification_report_mode(report: &VerificationReport) -> String {
+    let stage = std::env::var(VERIFIER_REPORT_STAGE_ENV_VAR).map_or_else(
+        |_| "shadow".to_string(),
+        |value| value.trim().to_ascii_lowercase(),
+    );
+    let bucket = stable_percent_bucket(&report.report_id);
+    match stage.as_str() {
+        "typed" => "typed-primary".to_string(),
+        "ab" if bucket < 10 => "typed-primary".to_string(),
+        "shadow" if bucket < 10 => "shadow".to_string(),
+        _ => "text-primary".to_string(),
+    }
+}
+
+fn stable_percent_bucket(value: &str) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish() % 100
 }
 
 fn build_assistant_message(
@@ -1179,9 +1270,10 @@ impl ToolExecutor for StaticToolExecutor {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_assistant_message, parse_auto_compaction_threshold, ApiClient, ApiRequest,
-        AssistantEvent, AutoCompactionEvent, ConversationRuntime, PromptCacheEvent, RuntimeError,
-        StaticToolExecutor, ToolExecutor, DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
+        build_assistant_message, parse_auto_compaction_threshold, stable_percent_bucket,
+        verification_report_mode, ApiClient, ApiRequest, AssistantEvent, AutoCompactionEvent,
+        ConversationRuntime, PromptCacheEvent, RuntimeError, StaticToolExecutor, ToolExecutor,
+        DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD, VERIFIER_REPORT_STAGE_ENV_VAR,
     };
     use crate::compact::CompactionConfig;
     use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
@@ -1193,13 +1285,14 @@ mod tests {
     use crate::session::{ContentBlock, MessageRole, Session};
     use crate::usage::TokenUsage;
     use crate::verifier::{
-        VerificationContext, VerificationPhase, VerificationReport, VerificationStatus,
-        VerificationTarget, Verifier,
+        VerificationContext, VerificationFailureKind, VerificationPhase, VerificationReport,
+        VerificationStatus, VerificationStepReport, VerificationTarget, Verifier,
     };
     use crate::ToolError;
     use std::fs;
     use std::path::PathBuf;
     use std::sync::Arc;
+    use std::sync::{Mutex, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
     use telemetry::{MemoryTelemetrySink, SessionTracer, TelemetryEvent};
 
@@ -1263,6 +1356,11 @@ mod tests {
         }
     }
 
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
     struct PromptAllowOnce;
 
     impl PermissionPrompter for PromptAllowOnce {
@@ -1290,6 +1388,7 @@ mod tests {
                 git_status: None,
                 git_diff: None,
                 git_context: None,
+                context_pack: None,
                 instruction_files: Vec::new(),
             })
             .with_os("linux", "6.8")
@@ -2692,14 +2791,180 @@ mod tests {
         assert!(summary.verification_gate.passed);
     }
 
+    #[test]
+    fn verification_report_mode_supports_shadow_ab_and_typed_stages() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::env::remove_var(VERIFIER_REPORT_STAGE_ENV_VAR);
+        let shadow_report = test_verification_report_with_id("shadow-bucket");
+        let shadow_bucket = stable_percent_bucket(&shadow_report.report_id);
+        let shadow_mode = verification_report_mode(&shadow_report);
+        if shadow_bucket < 10 {
+            assert_eq!(shadow_mode, "shadow");
+        } else {
+            assert_eq!(shadow_mode, "text-primary");
+        }
+
+        let typed_id = report_id_for_bucket(|bucket| bucket < 10);
+        std::env::set_var(VERIFIER_REPORT_STAGE_ENV_VAR, "ab");
+        let typed_report = test_verification_report_with_id(&typed_id);
+        assert_eq!(verification_report_mode(&typed_report), "typed-primary");
+
+        let control_id = report_id_for_bucket(|bucket| bucket >= 10);
+        let control_report = test_verification_report_with_id(&control_id);
+        assert_eq!(verification_report_mode(&control_report), "text-primary");
+
+        std::env::set_var(VERIFIER_REPORT_STAGE_ENV_VAR, "typed");
+        assert_eq!(verification_report_mode(&control_report), "typed-primary");
+        std::env::remove_var(VERIFIER_REPORT_STAGE_ENV_VAR);
+    }
+
+    #[test]
+    fn verifier_telemetry_records_report_mode_failure_kind_and_target_scope() {
+        struct EditApi {
+            done: bool,
+        }
+
+        impl ApiClient for EditApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                if self.done {
+                    Ok(vec![
+                        AssistantEvent::TextDelta("done".to_string()),
+                        AssistantEvent::MessageStop,
+                    ])
+                } else {
+                    self.done = true;
+                    Ok(vec![
+                        AssistantEvent::ToolUse {
+                            id: "tool-1".to_string(),
+                            name: "edit_file".to_string(),
+                            input: r#"{"file_path":"src/lib.rs"}"#.to_string(),
+                        },
+                        AssistantEvent::MessageStop,
+                    ])
+                }
+            }
+        }
+
+        struct TelemetryVerifier;
+
+        impl Verifier for TelemetryVerifier {
+            fn quick_verify(&self, context: &VerificationContext) -> Vec<VerificationReport> {
+                vec![VerificationReport {
+                    report_id: "report-typed".to_string(),
+                    phase: VerificationPhase::Quick,
+                    adapter_id: "rust-cargo".to_string(),
+                    project_root: PathBuf::from("/workspace"),
+                    touched_paths: context.touched_paths.clone(),
+                    status: VerificationStatus::Failed,
+                    summary_text: "[verifier:quick:rust-cargo] failed (/workspace)".to_string(),
+                    steps: vec![VerificationStepReport {
+                        adapter: "rust-cargo".to_string(),
+                        project_root: PathBuf::from("/workspace"),
+                        label: "cargo check".to_string(),
+                        command: "cargo check -p demo".to_string(),
+                        phase: VerificationPhase::Quick,
+                        status: VerificationStatus::Failed,
+                        failure_kind: Some(VerificationFailureKind::Code),
+                        duration_ms: 42,
+                        truncated_output: "error[E0308]".to_string(),
+                        step_kind: Some("cargo_check".to_string()),
+                        target_scope: Some("package".to_string()),
+                        package_name: Some("demo".to_string()),
+                        package_manager: None,
+                        launcher_kind: None,
+                    }],
+                }]
+            }
+
+            fn final_verify(&self, _target: &VerificationTarget) -> Option<VerificationReport> {
+                None
+            }
+        }
+
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::env::set_var(VERIFIER_REPORT_STAGE_ENV_VAR, "typed");
+        let sink = Arc::new(MemoryTelemetrySink::default());
+        let tracer = SessionTracer::new("session-runtime", sink.clone());
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            EditApi { done: false },
+            StaticToolExecutor::new().register("edit_file", |_| Ok("edited".to_string())),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_verifier(Box::new(TelemetryVerifier))
+        .with_session_tracer(tracer);
+
+        let _summary = runtime.run_turn("fix", None).expect("turn should complete");
+        std::env::remove_var(VERIFIER_REPORT_STAGE_ENV_VAR);
+
+        let events = sink.events();
+        let verifier_trace = events
+            .into_iter()
+            .find_map(|event| match event {
+                TelemetryEvent::SessionTrace(trace) if trace.name == "verifier_ran" => Some(trace),
+                _ => None,
+            })
+            .expect("verifier trace should exist");
+        assert_eq!(
+            verifier_trace.attributes.get("report_mode"),
+            Some(&serde_json::Value::String("typed-primary".to_string()))
+        );
+        assert_eq!(
+            verifier_trace.attributes.get("failure_kind"),
+            Some(&serde_json::Value::String("code".to_string()))
+        );
+        assert_eq!(
+            verifier_trace.attributes.get("target_scope"),
+            Some(&serde_json::Value::String("package".to_string()))
+        );
+        assert_eq!(
+            verifier_trace.attributes.get("mutation_sequence"),
+            Some(&serde_json::Value::Number(1_u64.into()))
+        );
+    }
+
     fn test_verification_report(
         phase: VerificationPhase,
         status: VerificationStatus,
         touched_paths: &[PathBuf],
         summary_text: &str,
     ) -> VerificationReport {
+        test_verification_report_with_fields(
+            format!("test-{}-{}", phase.as_str(), status.as_str()),
+            phase,
+            status,
+            touched_paths,
+            summary_text,
+        )
+    }
+
+    fn test_verification_report_with_id(report_id: &str) -> VerificationReport {
+        test_verification_report_with_fields(
+            report_id.to_string(),
+            VerificationPhase::Quick,
+            VerificationStatus::Failed,
+            &[PathBuf::from("src/lib.rs")],
+            "[verifier:quick:rust-cargo] failed (/workspace)\n[verifier] cargo check: FAIL",
+        )
+    }
+
+    fn test_verification_report_with_fields(
+        report_id: String,
+        phase: VerificationPhase,
+        status: VerificationStatus,
+        touched_paths: &[PathBuf],
+        summary_text: &str,
+    ) -> VerificationReport {
         VerificationReport {
-            report_id: format!("test-{}-{}", phase.as_str(), status.as_str()),
+            report_id,
             phase,
             adapter_id: "rust-cargo".to_string(),
             project_root: PathBuf::from("/workspace"),
@@ -2708,5 +2973,15 @@ mod tests {
             summary_text: summary_text.to_string(),
             steps: Vec::new(),
         }
+    }
+
+    fn report_id_for_bucket(predicate: impl Fn(u64) -> bool) -> String {
+        for index in 0..10_000 {
+            let candidate = format!("bucket-report-{index}");
+            if predicate(stable_percent_bucket(&candidate)) {
+                return candidate;
+            }
+        }
+        panic!("failed to find report id for bucket predicate");
     }
 }

@@ -8,6 +8,7 @@ use crate::sandbox::{FilesystemIsolationMode, SandboxConfig};
 
 /// Schema name advertised by generated settings files.
 pub const CLAW_SETTINGS_SCHEMA_NAME: &str = "SettingsSchema";
+const VERIFIER_AUTO_ENV_VAR: &str = "CLAUDE_CODE_VERIFIER_AUTO";
 
 /// Origin of a loaded settings file in the configuration precedence chain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -76,6 +77,7 @@ pub struct RuntimeFeatureConfig {
 pub enum RuntimeVerifierMode {
     Legacy,
     Staged,
+    Auto,
 }
 
 impl RuntimeVerifierMode {
@@ -84,6 +86,7 @@ impl RuntimeVerifierMode {
         match self {
             Self::Legacy => "legacy",
             Self::Staged => "staged",
+            Self::Auto => "auto",
         }
     }
 }
@@ -141,7 +144,15 @@ impl RuntimeVerifierConfig {
 
     #[must_use]
     pub fn staged(&self) -> bool {
-        self.mode == RuntimeVerifierMode::Staged
+        matches!(
+            self.mode,
+            RuntimeVerifierMode::Staged | RuntimeVerifierMode::Auto
+        )
+    }
+
+    #[must_use]
+    pub fn auto(&self) -> bool {
+        self.mode == RuntimeVerifierMode::Auto
     }
 
     #[must_use]
@@ -934,24 +945,30 @@ fn validate_optional_hooks_config(
 
 fn parse_optional_verifier_config(root: &JsonValue) -> Result<RuntimeVerifierConfig, ConfigError> {
     let Some(object) = root.as_object() else {
-        return Ok(RuntimeVerifierConfig::default());
+        return Ok(default_verifier_config_with_env());
     };
     let Some(verifier_value) = object.get("verifier") else {
-        return Ok(RuntimeVerifierConfig::default());
+        return Ok(default_verifier_config_with_env());
     };
     let verifier = expect_object(verifier_value, "merged settings.verifier")?;
 
     let mut config = RuntimeVerifierConfig::default();
+    let mut enabled_explicit = false;
+    let mut mode_explicit = false;
+    let mut final_gate_explicit = false;
     if let Some(enabled) = optional_bool(verifier, "enabled", "merged settings.verifier")? {
+        enabled_explicit = true;
         config.enabled = enabled;
     }
     if let Some(mode) = optional_string(verifier, "mode", "merged settings.verifier")? {
+        mode_explicit = true;
         config.mode = match mode {
             "legacy" => RuntimeVerifierMode::Legacy,
             "staged" => RuntimeVerifierMode::Staged,
+            "auto" => RuntimeVerifierMode::Auto,
             other => {
                 return Err(ConfigError::Parse(format!(
-                    "merged settings.verifier.mode must be legacy or staged, got `{other}`"
+                    "merged settings.verifier.mode must be legacy, staged, or auto, got `{other}`"
                 )))
             }
         };
@@ -962,6 +979,7 @@ fn parse_optional_verifier_config(root: &JsonValue) -> Result<RuntimeVerifierCon
         config.quick_on_write = quick_on_write;
     }
     if let Some(final_gate) = optional_bool(verifier, "finalGate", "merged settings.verifier")? {
+        final_gate_explicit = true;
         config.final_gate = final_gate;
         if final_gate && config.mode == RuntimeVerifierMode::Legacy {
             config.mode = RuntimeVerifierMode::Staged;
@@ -1012,7 +1030,30 @@ fn parse_optional_verifier_config(root: &JsonValue) -> Result<RuntimeVerifierCon
             config.python_timeout_secs = v;
         }
     }
+    if verifier_auto_env_enabled() && !enabled_explicit && !mode_explicit {
+        config.enabled = true;
+        config.mode = RuntimeVerifierMode::Auto;
+        if !final_gate_explicit {
+            config.final_gate = true;
+        }
+    }
     Ok(config)
+}
+
+fn default_verifier_config_with_env() -> RuntimeVerifierConfig {
+    let mut config = RuntimeVerifierConfig::default();
+    if verifier_auto_env_enabled() {
+        config.enabled = true;
+        config.mode = RuntimeVerifierMode::Auto;
+        config.final_gate = true;
+    }
+    config
+}
+
+fn verifier_auto_env_enabled() -> bool {
+    std::env::var(VERIFIER_AUTO_ENV_VAR)
+        .ok()
+        .is_some_and(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "True"))
 }
 
 fn parse_optional_permission_rules(
@@ -1484,11 +1525,12 @@ mod tests {
     use super::{
         deep_merge_objects, parse_permission_mode_label, ConfigLoader, ConfigSource,
         McpServerConfig, McpTransport, ResolvedPermissionMode, RuntimeHookConfig,
-        RuntimePluginConfig, RuntimeVerifierMode, CLAW_SETTINGS_SCHEMA_NAME,
+        RuntimePluginConfig, RuntimeVerifierMode, CLAW_SETTINGS_SCHEMA_NAME, VERIFIER_AUTO_ENV_VAR,
     };
     use crate::json::JsonValue;
     use crate::sandbox::FilesystemIsolationMode;
     use std::fs;
+    use std::sync::{Mutex, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_dir() -> std::path::PathBuf {
@@ -1497,6 +1539,11 @@ mod tests {
             .expect("time should be after epoch")
             .as_nanos();
         std::env::temp_dir().join(format!("runtime-config-{nanos}"))
+    }
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
     }
 
     #[test]
@@ -2434,6 +2481,132 @@ mod tests {
         assert!(config.verifier().staged());
         assert!(config.verifier().final_gate());
 
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn parses_auto_verifier_mode_from_config() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        let user_settings = home.join("settings.json");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::write(
+            &user_settings,
+            r#"{
+  "verifier": {
+    "enabled": true,
+    "mode": "auto",
+    "finalGate": true
+  }
+}"#,
+        )
+        .expect("write user settings");
+
+        let config = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should parse");
+
+        assert_eq!(config.verifier().mode(), RuntimeVerifierMode::Auto);
+        assert!(config.verifier().staged());
+        assert!(config.verifier().auto());
+        assert!(config.verifier().final_gate());
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn verifier_auto_env_enables_auto_mode_when_config_is_implicit() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::env::set_var(VERIFIER_AUTO_ENV_VAR, "1");
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::write(home.join("settings.json"), "{}").expect("write empty settings");
+
+        let config = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should parse");
+
+        assert!(config.verifier().enabled());
+        assert_eq!(config.verifier().mode(), RuntimeVerifierMode::Auto);
+        assert!(config.verifier().final_gate());
+
+        std::env::remove_var(VERIFIER_AUTO_ENV_VAR);
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn verifier_auto_env_does_not_override_explicit_disable() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::env::set_var(VERIFIER_AUTO_ENV_VAR, "1");
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        let user_settings = home.join("settings.json");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::write(
+            &user_settings,
+            r#"{
+  "verifier": {
+    "enabled": false
+  }
+}"#,
+        )
+        .expect("write settings");
+
+        let config = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should parse");
+
+        assert!(!config.verifier().enabled());
+        assert_eq!(config.verifier().mode(), RuntimeVerifierMode::Legacy);
+
+        std::env::remove_var(VERIFIER_AUTO_ENV_VAR);
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn verifier_auto_env_does_not_override_explicit_mode() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::env::set_var(VERIFIER_AUTO_ENV_VAR, "1");
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        let user_settings = home.join("settings.json");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::write(
+            &user_settings,
+            r#"{
+  "verifier": {
+    "enabled": true,
+    "mode": "staged",
+    "finalGate": false
+  }
+}"#,
+        )
+        .expect("write settings");
+
+        let config = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should parse");
+
+        assert_eq!(config.verifier().mode(), RuntimeVerifierMode::Staged);
+        assert!(!config.verifier().auto());
+        assert!(!config.verifier().final_gate());
+
+        std::env::remove_var(VERIFIER_AUTO_ENV_VAR);
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
 }

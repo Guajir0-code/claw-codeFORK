@@ -64,6 +64,7 @@ fn quick_only() -> CargoVerifierConfig {
         node_timeout: Duration::from_mins(2),
         python_enabled: false,
         python_timeout: Duration::from_mins(2),
+        auto_mode: false,
     }
 }
 
@@ -100,6 +101,7 @@ fn python_only() -> CargoVerifierConfig {
         node_timeout: Duration::from_mins(2),
         python_enabled: true,
         python_timeout: Duration::from_mins(2),
+        auto_mode: false,
     }
 }
 
@@ -268,6 +270,7 @@ fn later_steps_are_skipped_after_first_failure_in_legacy_mode() {
         node_timeout: Duration::from_mins(2),
         python_enabled: false,
         python_timeout: Duration::from_mins(2),
+        auto_mode: false,
     };
     let v = CargoVerifier::new(config);
     let result = quick_report(&v, "edit_file", &tool_input(&file)).unwrap();
@@ -304,6 +307,7 @@ fn fmt_violation_is_detected_when_fmt_enabled() {
         node_timeout: Duration::from_mins(2),
         python_enabled: false,
         python_timeout: Duration::from_mins(2),
+        auto_mode: false,
     };
     let v = CargoVerifier::new(config);
     let result = quick_report(&v, "edit_file", &tool_input(&file)).unwrap();

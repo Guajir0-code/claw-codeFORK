@@ -28,6 +28,34 @@ pub enum MessageRole {
 
 /// Structured message content stored inside a [`Session`].
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerificationPrimaryFailureBlock {
+    pub label: String,
+    pub status: VerificationStatus,
+    pub failure_kind: Option<String>,
+    pub output_excerpt: String,
+    pub step_kind: Option<String>,
+    pub target_scope: Option<String>,
+    pub package_name: Option<String>,
+    pub package_manager: Option<String>,
+    pub launcher_kind: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerificationCompactStepBlock {
+    pub label: String,
+    pub status: VerificationStatus,
+    pub failure_kind: Option<String>,
+    pub duration_ms: u64,
+    pub step_kind: Option<String>,
+    pub target_scope: Option<String>,
+    pub package_name: Option<String>,
+    pub package_manager: Option<String>,
+    pub launcher_kind: Option<String>,
+}
+
+/// Structured message content stored inside a [`Session`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)] // VerificationReport is intentionally structured; boxing would churn call sites
 pub enum ContentBlock {
     Text {
         text: String,
@@ -48,6 +76,12 @@ pub enum ContentBlock {
         phase: VerificationPhase,
         status: VerificationStatus,
         summary_text: String,
+        adapter_id: Option<String>,
+        project_root: Option<String>,
+        touched_paths: Vec<String>,
+        primary_failure: Option<VerificationPrimaryFailureBlock>,
+        steps: Vec<VerificationCompactStepBlock>,
+        report_mode: Option<String>,
     },
 }
 
@@ -677,7 +711,7 @@ impl ConversationMessage {
     }
 
     #[must_use]
-    pub fn verification_report(report: &VerificationReport) -> Self {
+    pub fn verification_report(report: &VerificationReport, report_mode: Option<&str>) -> Self {
         Self {
             role: MessageRole::Verification,
             blocks: vec![ContentBlock::VerificationReport {
@@ -685,6 +719,42 @@ impl ConversationMessage {
                 phase: report.phase,
                 status: report.status,
                 summary_text: report.summary_text.clone(),
+                adapter_id: Some(report.adapter_id.clone()),
+                project_root: Some(report.project_root.display().to_string()),
+                touched_paths: report
+                    .touched_paths
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect(),
+                primary_failure: report.primary_step().and_then(|step| {
+                    (!step.status.is_success()).then(|| VerificationPrimaryFailureBlock {
+                        label: step.label.clone(),
+                        status: step.status,
+                        failure_kind: step.failure_kind.map(|kind| kind.as_str().to_string()),
+                        output_excerpt: step.truncated_output.clone(),
+                        step_kind: step.step_kind.clone(),
+                        target_scope: step.target_scope.clone(),
+                        package_name: step.package_name.clone(),
+                        package_manager: step.package_manager.clone(),
+                        launcher_kind: step.launcher_kind.clone(),
+                    })
+                }),
+                steps: report
+                    .steps
+                    .iter()
+                    .map(|step| VerificationCompactStepBlock {
+                        label: step.label.clone(),
+                        status: step.status,
+                        failure_kind: step.failure_kind.map(|kind| kind.as_str().to_string()),
+                        duration_ms: step.duration_ms,
+                        step_kind: step.step_kind.clone(),
+                        target_scope: step.target_scope.clone(),
+                        package_name: step.package_name.clone(),
+                        package_manager: step.package_manager.clone(),
+                        launcher_kind: step.launcher_kind.clone(),
+                    })
+                    .collect(),
+                report_mode: report_mode.map(ToOwned::to_owned),
             }],
             usage: None,
         }
@@ -754,6 +824,7 @@ impl ConversationMessage {
 
 impl ContentBlock {
     #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn to_json(&self) -> JsonValue {
         let mut object = BTreeMap::new();
         match self {
@@ -796,6 +867,12 @@ impl ContentBlock {
                 phase,
                 status,
                 summary_text,
+                adapter_id,
+                project_root,
+                touched_paths,
+                primary_failure,
+                steps,
+                report_mode,
             } => {
                 object.insert(
                     "type".to_string(),
@@ -817,6 +894,49 @@ impl ContentBlock {
                     "summary_text".to_string(),
                     JsonValue::String(summary_text.clone()),
                 );
+                if let Some(adapter_id) = adapter_id {
+                    object.insert(
+                        "adapter_id".to_string(),
+                        JsonValue::String(adapter_id.clone()),
+                    );
+                }
+                if let Some(project_root) = project_root {
+                    object.insert(
+                        "project_root".to_string(),
+                        JsonValue::String(project_root.clone()),
+                    );
+                }
+                if !touched_paths.is_empty() {
+                    object.insert(
+                        "touched_paths".to_string(),
+                        JsonValue::Array(
+                            touched_paths
+                                .iter()
+                                .map(|path| JsonValue::String(path.clone()))
+                                .collect(),
+                        ),
+                    );
+                }
+                if let Some(primary_failure) = primary_failure {
+                    object.insert("primary_failure".to_string(), primary_failure.to_json());
+                }
+                if !steps.is_empty() {
+                    object.insert(
+                        "steps".to_string(),
+                        JsonValue::Array(
+                            steps
+                                .iter()
+                                .map(VerificationCompactStepBlock::to_json)
+                                .collect(),
+                        ),
+                    );
+                }
+                if let Some(report_mode) = report_mode {
+                    object.insert(
+                        "report_mode".to_string(),
+                        JsonValue::String(report_mode.clone()),
+                    );
+                }
             }
         }
         JsonValue::Object(object)
@@ -853,11 +973,116 @@ impl ContentBlock {
                 phase: parse_verification_phase(&required_string(object, "phase")?)?,
                 status: parse_verification_status(&required_string(object, "status")?)?,
                 summary_text: required_string(object, "summary_text")?,
+                adapter_id: optional_string(object, "adapter_id"),
+                project_root: optional_string(object, "project_root"),
+                touched_paths: optional_string_array(object, "touched_paths")?,
+                primary_failure: object
+                    .get("primary_failure")
+                    .map(VerificationPrimaryFailureBlock::from_json)
+                    .transpose()?,
+                steps: object
+                    .get("steps")
+                    .and_then(JsonValue::as_array)
+                    .map(|steps| {
+                        steps
+                            .iter()
+                            .map(VerificationCompactStepBlock::from_json)
+                            .collect::<Result<Vec<_>, _>>()
+                    })
+                    .transpose()?
+                    .unwrap_or_default(),
+                report_mode: optional_string(object, "report_mode"),
             }),
             other => Err(SessionError::Format(format!(
                 "unsupported block type: {other}"
             ))),
         }
+    }
+}
+
+impl VerificationPrimaryFailureBlock {
+    fn to_json(&self) -> JsonValue {
+        let mut object = BTreeMap::new();
+        object.insert("label".to_string(), JsonValue::String(self.label.clone()));
+        object.insert(
+            "status".to_string(),
+            JsonValue::String(self.status.as_str().to_string()),
+        );
+        object.insert(
+            "output_excerpt".to_string(),
+            JsonValue::String(self.output_excerpt.clone()),
+        );
+        insert_optional_string(&mut object, "failure_kind", self.failure_kind.as_ref());
+        insert_optional_string(&mut object, "step_kind", self.step_kind.as_ref());
+        insert_optional_string(&mut object, "target_scope", self.target_scope.as_ref());
+        insert_optional_string(&mut object, "package_name", self.package_name.as_ref());
+        insert_optional_string(
+            &mut object,
+            "package_manager",
+            self.package_manager.as_ref(),
+        );
+        insert_optional_string(&mut object, "launcher_kind", self.launcher_kind.as_ref());
+        JsonValue::Object(object)
+    }
+
+    fn from_json(value: &JsonValue) -> Result<Self, SessionError> {
+        let object = value
+            .as_object()
+            .ok_or_else(|| SessionError::Format("primary_failure must be an object".to_string()))?;
+        Ok(Self {
+            label: required_string(object, "label")?,
+            status: parse_verification_status(&required_string(object, "status")?)?,
+            failure_kind: optional_string(object, "failure_kind"),
+            output_excerpt: required_string(object, "output_excerpt")?,
+            step_kind: optional_string(object, "step_kind"),
+            target_scope: optional_string(object, "target_scope"),
+            package_name: optional_string(object, "package_name"),
+            package_manager: optional_string(object, "package_manager"),
+            launcher_kind: optional_string(object, "launcher_kind"),
+        })
+    }
+}
+
+impl VerificationCompactStepBlock {
+    fn to_json(&self) -> JsonValue {
+        let mut object = BTreeMap::new();
+        object.insert("label".to_string(), JsonValue::String(self.label.clone()));
+        object.insert(
+            "status".to_string(),
+            JsonValue::String(self.status.as_str().to_string()),
+        );
+        object.insert(
+            "duration_ms".to_string(),
+            JsonValue::Number(i64::try_from(self.duration_ms).unwrap_or(i64::MAX)),
+        );
+        insert_optional_string(&mut object, "failure_kind", self.failure_kind.as_ref());
+        insert_optional_string(&mut object, "step_kind", self.step_kind.as_ref());
+        insert_optional_string(&mut object, "target_scope", self.target_scope.as_ref());
+        insert_optional_string(&mut object, "package_name", self.package_name.as_ref());
+        insert_optional_string(
+            &mut object,
+            "package_manager",
+            self.package_manager.as_ref(),
+        );
+        insert_optional_string(&mut object, "launcher_kind", self.launcher_kind.as_ref());
+        JsonValue::Object(object)
+    }
+
+    fn from_json(value: &JsonValue) -> Result<Self, SessionError> {
+        let object = value.as_object().ok_or_else(|| {
+            SessionError::Format("verification step must be an object".to_string())
+        })?;
+        Ok(Self {
+            label: required_string(object, "label")?,
+            status: parse_verification_status(&required_string(object, "status")?)?,
+            failure_kind: optional_string(object, "failure_kind"),
+            duration_ms: required_u64(object, "duration_ms")?,
+            step_kind: optional_string(object, "step_kind"),
+            target_scope: optional_string(object, "target_scope"),
+            package_name: optional_string(object, "package_name"),
+            package_manager: optional_string(object, "package_manager"),
+            launcher_kind: optional_string(object, "launcher_kind"),
+        })
     }
 }
 
@@ -1025,6 +1250,43 @@ fn required_string(
         .and_then(JsonValue::as_str)
         .map(ToOwned::to_owned)
         .ok_or_else(|| SessionError::Format(format!("missing {key}")))
+}
+
+fn optional_string(object: &BTreeMap<String, JsonValue>, key: &str) -> Option<String> {
+    object
+        .get(key)
+        .and_then(JsonValue::as_str)
+        .map(ToOwned::to_owned)
+}
+
+fn optional_string_array(
+    object: &BTreeMap<String, JsonValue>,
+    key: &str,
+) -> Result<Vec<String>, SessionError> {
+    let Some(value) = object.get(key) else {
+        return Ok(Vec::new());
+    };
+    let array = value
+        .as_array()
+        .ok_or_else(|| SessionError::Format(format!("{key} must be an array")))?;
+    array
+        .iter()
+        .map(|item| {
+            item.as_str()
+                .map(ToOwned::to_owned)
+                .ok_or_else(|| SessionError::Format(format!("{key} entries must be strings")))
+        })
+        .collect()
+}
+
+fn insert_optional_string(
+    object: &mut BTreeMap<String, JsonValue>,
+    key: &str,
+    value: Option<&String>,
+) {
+    if let Some(value) = value {
+        object.insert(key.to_string(), JsonValue::String(value.clone()));
+    }
 }
 
 fn parse_verification_phase(value: &str) -> Result<VerificationPhase, SessionError> {
@@ -1227,6 +1489,10 @@ mod tests {
     };
     use crate::json::JsonValue;
     use crate::usage::TokenUsage;
+    use crate::verifier::{
+        VerificationFailureKind, VerificationPhase, VerificationReport, VerificationStatus,
+        VerificationStepReport,
+    };
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1527,6 +1793,140 @@ mod tests {
         // then
         assert_eq!(restored.workspace_root(), Some(workspace_root.as_path()));
         assert_eq!(forked.workspace_root(), Some(workspace_root.as_path()));
+    }
+
+    #[test]
+    fn verification_report_round_trips_structured_fields() {
+        let report = sample_verification_report();
+        let message = ConversationMessage::verification_report(&report, Some("typed-primary"));
+
+        let json = message.to_json();
+        let restored = ConversationMessage::from_json(&json).expect("message should parse");
+
+        let ContentBlock::VerificationReport {
+            adapter_id,
+            project_root,
+            touched_paths,
+            primary_failure,
+            steps,
+            report_mode,
+            ..
+        } = &restored.blocks[0]
+        else {
+            panic!("expected verification report block");
+        };
+        assert_eq!(adapter_id.as_deref(), Some("rust-cargo"));
+        assert_eq!(project_root.as_deref(), Some("/tmp/demo-workspace"));
+        assert_eq!(touched_paths, &vec!["src/lib.rs".to_string()]);
+        assert_eq!(report_mode.as_deref(), Some("typed-primary"));
+        let primary_failure = primary_failure
+            .as_ref()
+            .expect("primary failure should be persisted");
+        assert_eq!(primary_failure.failure_kind.as_deref(), Some("code"));
+        assert_eq!(primary_failure.step_kind.as_deref(), Some("cargo_clippy"));
+        assert_eq!(primary_failure.target_scope.as_deref(), Some("package"));
+        assert_eq!(primary_failure.package_name.as_deref(), Some("demo"));
+        assert_eq!(steps.len(), 2);
+        assert_eq!(steps[1].failure_kind.as_deref(), Some("code"));
+        assert_eq!(steps[1].package_manager, None);
+    }
+
+    #[test]
+    fn verification_report_from_json_accepts_legacy_payload_without_structured_fields() {
+        let block = JsonValue::Object(
+            [
+                (
+                    "type".to_string(),
+                    JsonValue::String("verification_report".to_string()),
+                ),
+                (
+                    "report_id".to_string(),
+                    JsonValue::String("legacy-report".to_string()),
+                ),
+                ("phase".to_string(), JsonValue::String("quick".to_string())),
+                (
+                    "status".to_string(),
+                    JsonValue::String("failed".to_string()),
+                ),
+                (
+                    "summary_text".to_string(),
+                    JsonValue::String("legacy verifier summary".to_string()),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        );
+
+        let parsed = ContentBlock::from_json(&block).expect("legacy payload should parse");
+
+        let ContentBlock::VerificationReport {
+            report_id,
+            summary_text,
+            adapter_id,
+            project_root,
+            touched_paths,
+            primary_failure,
+            steps,
+            report_mode,
+            ..
+        } = parsed
+        else {
+            panic!("expected verification report block");
+        };
+        assert_eq!(report_id, "legacy-report");
+        assert_eq!(summary_text, "legacy verifier summary");
+        assert_eq!(adapter_id, None);
+        assert_eq!(project_root, None);
+        assert!(touched_paths.is_empty());
+        assert_eq!(primary_failure, None);
+        assert!(steps.is_empty());
+        assert_eq!(report_mode, None);
+    }
+
+    fn sample_verification_report() -> VerificationReport {
+        VerificationReport {
+            report_id: "report-structured".to_string(),
+            phase: VerificationPhase::Quick,
+            adapter_id: "rust-cargo".to_string(),
+            project_root: PathBuf::from("/tmp/demo-workspace"),
+            touched_paths: vec![PathBuf::from("src/lib.rs")],
+            status: VerificationStatus::Failed,
+            summary_text: "[verifier:quick:rust-cargo] failed (/tmp/demo-workspace)".to_string(),
+            steps: vec![
+                VerificationStepReport {
+                    adapter: "rust-cargo".to_string(),
+                    project_root: PathBuf::from("/tmp/demo-workspace"),
+                    label: "cargo check".to_string(),
+                    command: "cargo check -p demo".to_string(),
+                    phase: VerificationPhase::Quick,
+                    status: VerificationStatus::Passed,
+                    failure_kind: None,
+                    duration_ms: 11,
+                    truncated_output: "ok".to_string(),
+                    step_kind: Some("cargo_check".to_string()),
+                    target_scope: Some("package".to_string()),
+                    package_name: Some("demo".to_string()),
+                    package_manager: None,
+                    launcher_kind: None,
+                },
+                VerificationStepReport {
+                    adapter: "rust-cargo".to_string(),
+                    project_root: PathBuf::from("/tmp/demo-workspace"),
+                    label: "cargo clippy".to_string(),
+                    command: "cargo clippy -p demo -- -D warnings".to_string(),
+                    phase: VerificationPhase::Quick,
+                    status: VerificationStatus::Failed,
+                    failure_kind: Some(VerificationFailureKind::Code),
+                    duration_ms: 22,
+                    truncated_output: "error[E0308]: mismatched types".to_string(),
+                    step_kind: Some("cargo_clippy".to_string()),
+                    target_scope: Some("package".to_string()),
+                    package_name: Some("demo".to_string()),
+                    package_manager: None,
+                    launcher_kind: None,
+                },
+            ],
+        }
     }
 
     fn temp_session_path(label: &str) -> PathBuf {

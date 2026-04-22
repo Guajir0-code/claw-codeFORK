@@ -42,12 +42,31 @@ pub const SYSTEM_PROMPT_DYNAMIC_BOUNDARY: &str = "__SYSTEM_PROMPT_DYNAMIC_BOUNDA
 pub const FRONTIER_MODEL_NAME: &str = "Claude Opus 4.6";
 const MAX_INSTRUCTION_FILE_CHARS: usize = 4_000;
 const MAX_TOTAL_INSTRUCTION_CHARS: usize = 12_000;
+const MAX_CONTEXT_PACK_CHARS: usize = 6_000;
+const MAX_CONTEXT_PACK_FILES: usize = 8;
 
 /// Contents of an instruction file included in prompt construction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContextFile {
     pub path: PathBuf,
     pub content: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextPackFile {
+    pub status: String,
+    pub path: PathBuf,
+    pub project_kind: Option<String>,
+    pub project_root: Option<PathBuf>,
+    pub entrypoint: Option<PathBuf>,
+    pub related_test: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ContextPack {
+    pub repo_root: Option<PathBuf>,
+    pub branch: Option<String>,
+    pub changed_files: Vec<ContextPackFile>,
 }
 
 /// Project-local context injected into the rendered system prompt.
@@ -58,6 +77,7 @@ pub struct ProjectContext {
     pub git_status: Option<String>,
     pub git_diff: Option<String>,
     pub git_context: Option<GitContext>,
+    pub context_pack: Option<ContextPack>,
     pub instruction_files: Vec<ContextFile>,
 }
 
@@ -74,6 +94,7 @@ impl ProjectContext {
             git_status: None,
             git_diff: None,
             git_context: None,
+            context_pack: None,
             instruction_files,
         })
     }
@@ -86,6 +107,11 @@ impl ProjectContext {
         context.git_status = read_git_status(&context.cwd);
         context.git_diff = read_git_diff(&context.cwd);
         context.git_context = GitContext::detect(&context.cwd);
+        context.context_pack = build_context_pack(
+            &context.cwd,
+            context.git_status.as_deref(),
+            context.git_context.as_ref(),
+        );
         Ok(context)
     }
 }
@@ -285,6 +311,277 @@ fn read_git_output(cwd: &Path, args: &[&str]) -> Option<String> {
     String::from_utf8(output.stdout).ok()
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GitStatusEntry {
+    status: String,
+    path: PathBuf,
+}
+
+fn build_context_pack(
+    cwd: &Path,
+    git_status: Option<&str>,
+    git_context: Option<&GitContext>,
+) -> Option<ContextPack> {
+    let repo_root = read_git_repo_root(cwd).or_else(|| Some(cwd.to_path_buf()))?;
+    let entries = parse_git_status_snapshot(git_status?);
+    if entries.is_empty() {
+        return None;
+    }
+
+    let changed_files = entries
+        .into_iter()
+        .take(MAX_CONTEXT_PACK_FILES)
+        .map(|entry| {
+            let absolute_path = repo_root.join(&entry.path);
+            let (project_root, project_kind) = detect_project_root(&absolute_path, &repo_root)
+                .unwrap_or((repo_root.clone(), None));
+            let entrypoint = find_entrypoint(&project_root, project_kind.as_deref());
+            let related_test =
+                find_related_test(&absolute_path, &project_root, project_kind.as_deref());
+            ContextPackFile {
+                status: entry.status,
+                path: entry.path,
+                project_kind,
+                project_root: Some(project_root),
+                entrypoint,
+                related_test,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    Some(ContextPack {
+        repo_root: Some(repo_root),
+        branch: git_context.and_then(|context| context.branch.clone()),
+        changed_files,
+    })
+}
+
+fn read_git_repo_root(cwd: &Path) -> Option<PathBuf> {
+    let output = Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(cwd)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    let trimmed = stdout.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(trimmed))
+    }
+}
+
+fn parse_git_status_snapshot(status: &str) -> Vec<GitStatusEntry> {
+    status
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim_end();
+            if trimmed.is_empty() || trimmed.starts_with("##") || trimmed.len() < 4 {
+                return None;
+            }
+            let status_code = &trimmed[..2];
+            let raw_path = trimmed[3..].trim();
+            if raw_path.is_empty() {
+                return None;
+            }
+            let path = raw_path
+                .split(" -> ")
+                .last()
+                .map(str::trim)
+                .filter(|path| !path.is_empty())?;
+            Some(GitStatusEntry {
+                status: classify_git_status(status_code),
+                path: PathBuf::from(path),
+            })
+        })
+        .collect()
+}
+
+fn classify_git_status(status_code: &str) -> String {
+    if status_code == "??" {
+        return "untracked".to_string();
+    }
+    let significant = status_code
+        .chars()
+        .find(|ch| !ch.is_ascii_whitespace())
+        .unwrap_or('M');
+    match significant {
+        'A' => "added",
+        'M' => "modified",
+        'D' => "deleted",
+        'R' => "renamed",
+        'C' => "copied",
+        'T' => "typechange",
+        'U' => "conflict",
+        _ => "changed",
+    }
+    .to_string()
+}
+
+fn detect_project_root(path: &Path, repo_root: &Path) -> Option<(PathBuf, Option<String>)> {
+    let mut current = if path.is_dir() {
+        path.to_path_buf()
+    } else {
+        path.parent()?.to_path_buf()
+    };
+    loop {
+        for (marker, kind) in [
+            ("Cargo.toml", "rust"),
+            ("package.json", "node"),
+            ("pyproject.toml", "python"),
+            ("go.mod", "go"),
+        ] {
+            if current.join(marker).is_file() {
+                return Some((current, Some(kind.to_string())));
+            }
+        }
+        if current == repo_root {
+            break;
+        }
+        current = current.parent()?.to_path_buf();
+    }
+    Some((repo_root.to_path_buf(), None))
+}
+
+fn find_entrypoint(project_root: &Path, project_kind: Option<&str>) -> Option<PathBuf> {
+    let candidates: &[&str] = match project_kind {
+        Some("rust") => &["src/main.rs", "src/lib.rs", "src/bin/main.rs"],
+        Some("node") => &[
+            "src/index.ts",
+            "src/main.ts",
+            "src/index.tsx",
+            "index.ts",
+            "src/index.js",
+            "src/main.js",
+            "index.js",
+        ],
+        Some("python") => &["app/main.py", "main.py", "src/main.py", "src/__init__.py"],
+        Some("go") => &["main.go", "cmd/main.go"],
+        _ => &["README.md"],
+    };
+    candidates
+        .iter()
+        .map(|candidate| project_root.join(candidate))
+        .find(|candidate| candidate.is_file())
+}
+
+fn find_related_test(
+    changed_path: &Path,
+    project_root: &Path,
+    project_kind: Option<&str>,
+) -> Option<PathBuf> {
+    let file_name = changed_path.file_name()?.to_string_lossy().to_lowercase();
+    if is_probable_test_name(&file_name) {
+        return changed_path
+            .strip_prefix(project_root)
+            .ok()
+            .map(|relative| project_root.join(relative));
+    }
+
+    let stem = changed_path.file_stem()?.to_string_lossy();
+    let extension = changed_path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("");
+    let candidates = match project_kind {
+        Some("rust") => vec![format!("tests/{stem}.rs"), format!("tests/test_{stem}.rs")],
+        Some("node") => vec![
+            format!("src/{stem}.test.{extension}"),
+            format!("src/{stem}.spec.{extension}"),
+            format!("tests/{stem}.test.{extension}"),
+            format!("tests/{stem}.spec.{extension}"),
+        ],
+        Some("python") => vec![format!("tests/test_{stem}.py"), format!("test_{stem}.py")],
+        Some("go") => vec![format!("{stem}_test.go"), format!("tests/{stem}_test.go")],
+        _ => Vec::new(),
+    };
+    candidates
+        .into_iter()
+        .map(|candidate| project_root.join(candidate))
+        .find(|candidate| candidate.is_file())
+}
+
+fn is_probable_test_name(file_name: &str) -> bool {
+    file_name.starts_with("test_")
+        || file_name.ends_with("_test.go")
+        || file_name.ends_with(".test.ts")
+        || file_name.ends_with(".test.tsx")
+        || file_name.ends_with(".test.js")
+        || file_name.ends_with(".spec.ts")
+        || file_name.ends_with(".spec.tsx")
+        || file_name.ends_with(".spec.js")
+        || file_name.ends_with("_test.rs")
+}
+
+fn render_context_pack(pack: &ContextPack) -> String {
+    let repo_root = pack.repo_root.as_deref().unwrap_or_else(|| Path::new("."));
+    let mut lines = Vec::new();
+    lines.extend(prepend_bullets(vec![
+        format!("Repo root: {}", repo_root.display()),
+        format!(
+            "Git branch: {}",
+            pack.branch.as_deref().unwrap_or("unknown")
+        ),
+        format!("Changed files in scope: {}.", pack.changed_files.len()),
+    ]));
+    lines.push("Changed file targets:".to_string());
+    for changed in &pack.changed_files {
+        let mut detail = format!(
+            " - {} {}",
+            changed.status,
+            relative_or_display(repo_root, &changed.path)
+        );
+        if let Some(kind) = &changed.project_kind {
+            use std::fmt::Write as _;
+            let _ = write!(detail, " [{kind}]");
+        }
+        if let Some(project_root) = &changed.project_root {
+            use std::fmt::Write as _;
+            let _ = write!(
+                detail,
+                " (root: {})",
+                relative_or_display(repo_root, project_root)
+            );
+        }
+        lines.push(detail);
+        if let Some(entrypoint) = &changed.entrypoint {
+            lines.push(format!(
+                "   entrypoint: {}",
+                relative_or_display(repo_root, entrypoint)
+            ));
+        }
+        if let Some(related_test) = &changed.related_test {
+            lines.push(format!(
+                "   related test: {}",
+                relative_or_display(repo_root, related_test)
+            ));
+        }
+    }
+    truncate_rendered_context_pack(&lines.join("\n"))
+}
+
+fn relative_or_display(base: &Path, path: &Path) -> String {
+    path.strip_prefix(base)
+        .unwrap_or(path)
+        .display()
+        .to_string()
+}
+
+fn truncate_rendered_context_pack(content: &str) -> String {
+    if content.chars().count() <= MAX_CONTEXT_PACK_CHARS {
+        return content.to_string();
+    }
+    let mut shortened = content
+        .chars()
+        .take(MAX_CONTEXT_PACK_CHARS)
+        .collect::<String>();
+    shortened.push_str("\n... [context pack truncated]");
+    shortened
+}
+
 fn render_project_context(project_context: &ProjectContext) -> String {
     let mut lines = vec!["# Project context".to_string()];
     let mut bullets = vec![
@@ -298,7 +595,11 @@ fn render_project_context(project_context: &ProjectContext) -> String {
         ));
     }
     lines.extend(prepend_bullets(bullets));
-    if let Some(status) = &project_context.git_status {
+    if let Some(context_pack) = &project_context.context_pack {
+        lines.push(String::new());
+        lines.push("Workspace context pack:".to_string());
+        lines.push(render_context_pack(context_pack));
+    } else if let Some(status) = &project_context.git_status {
         lines.push(String::new());
         lines.push("Git status snapshot:".to_string());
         lines.push(status.clone());
@@ -310,18 +611,6 @@ fn render_project_context(project_context: &ProjectContext) -> String {
             for c in &gc.recent_commits {
                 lines.push(format!("  {} {}", c.hash, c.subject));
             }
-        }
-    }
-    if let Some(diff) = &project_context.git_diff {
-        lines.push(String::new());
-        lines.push("Git diff snapshot:".to_string());
-        lines.push(diff.clone());
-    }
-    if let Some(git_context) = &project_context.git_context {
-        let rendered = git_context.render();
-        if !rendered.is_empty() {
-            lines.push(String::new());
-            lines.push(rendered);
         }
     }
     lines.join("\n")
@@ -521,8 +810,9 @@ fn get_actions_section() -> String {
 mod tests {
     use super::{
         collapse_blank_lines, display_context_path, normalize_instruction_content,
-        render_instruction_content, render_instruction_files, truncate_instruction_content,
-        ContextFile, ProjectContext, SystemPromptBuilder, SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
+        render_instruction_content, render_instruction_files, render_project_context,
+        truncate_instruction_content, truncate_rendered_context_pack, ContextFile, ProjectContext,
+        SystemPromptBuilder, MAX_CONTEXT_PACK_CHARS, SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
     };
     use crate::config::ConfigLoader;
     use std::fs;
@@ -732,11 +1022,15 @@ mod tests {
         let status = context.git_status.as_deref().expect("status snapshot");
         assert!(status.contains("## main"));
         assert!(status.contains("A  d.txt"));
+        let context_pack = context.context_pack.as_ref().expect("context pack");
+        assert_eq!(context_pack.changed_files.len(), 1);
+        assert_eq!(context_pack.changed_files[0].status, "added");
 
         assert!(rendered.contains("Recent commits (last 5):"));
         assert!(rendered.contains("first commit"));
-        assert!(rendered.contains("Git status snapshot:"));
-        assert!(rendered.contains("## main"));
+        assert!(rendered.contains("Workspace context pack:"));
+        assert!(rendered.contains("Git branch: main"));
+        assert!(rendered.contains("added d.txt"));
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
@@ -781,6 +1075,74 @@ mod tests {
         let diff = context.git_diff.expect("git diff should be present");
         assert!(diff.contains("Unstaged changes:"));
         assert!(diff.contains("tracked.txt"));
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn context_pack_detects_project_root_entrypoint_and_related_test() {
+        let _guard = env_lock();
+        ensure_valid_cwd();
+        let root = temp_dir();
+        fs::create_dir_all(root.join("src")).expect("src dir");
+        fs::create_dir_all(root.join("tests")).expect("tests dir");
+        std::process::Command::new("git")
+            .args(["init", "--quiet", "-b", "main"])
+            .current_dir(&root)
+            .status()
+            .expect("git init should run");
+        std::process::Command::new("git")
+            .args(["config", "user.email", "tests@example.com"])
+            .current_dir(&root)
+            .status()
+            .expect("git config email should run");
+        std::process::Command::new("git")
+            .args(["config", "user.name", "Runtime Prompt Tests"])
+            .current_dir(&root)
+            .status()
+            .expect("git config name should run");
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .expect("write Cargo.toml");
+        fs::write(root.join("src/main.rs"), "fn main() {}\n").expect("write main");
+        fs::write(root.join("src/lib.rs"), "pub fn value() -> usize { 1 }\n").expect("write lib");
+        fs::write(root.join("tests/lib.rs"), "#[test]\nfn smoke() {}\n").expect("write test");
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(&root)
+            .status()
+            .expect("git add should run");
+        std::process::Command::new("git")
+            .args(["commit", "-m", "init", "--quiet"])
+            .current_dir(&root)
+            .status()
+            .expect("git commit should run");
+        fs::write(root.join("src/lib.rs"), "pub fn value() -> usize { 2 }\n").expect("rewrite lib");
+
+        let context =
+            ProjectContext::discover_with_git(&root, "2026-03-31").expect("context should load");
+        let rendered = render_project_context(&context);
+        let context_pack = context.context_pack.as_ref().expect("context pack");
+        let changed = context_pack
+            .changed_files
+            .iter()
+            .find(|file| file.path == Path::new("src/lib.rs"))
+            .expect("changed file should be listed");
+
+        assert_eq!(changed.status, "modified");
+        assert_eq!(changed.project_kind.as_deref(), Some("rust"));
+        assert_eq!(changed.project_root.as_ref(), Some(&root));
+        assert_eq!(changed.entrypoint.as_ref(), Some(&root.join("src/main.rs")));
+        assert_eq!(
+            changed.related_test.as_ref(),
+            Some(&root.join("tests/lib.rs"))
+        );
+        assert!(rendered.contains("Workspace context pack:"));
+        assert!(rendered.contains("modified src/lib.rs [rust]"));
+        assert!(rendered.contains("entrypoint: src/main.rs"));
+        assert!(rendered.contains("related test: tests/lib.rs"));
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
@@ -887,6 +1249,87 @@ mod tests {
             .any(|file| file.path.ends_with(".claw/instructions.md")));
         assert!(
             render_instruction_files(&context.instruction_files).contains("instruction markdown")
+        );
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn rendered_context_pack_respects_6kb_cap() {
+        // Invariant: MAX_CONTEXT_PACK_CHARS is the spec'd 6KB budget.
+        assert_eq!(MAX_CONTEXT_PACK_CHARS, 6_000);
+
+        let fat = "x".repeat(20_000);
+        let rendered = truncate_rendered_context_pack(&fat);
+        assert!(
+            rendered.chars().count()
+                <= MAX_CONTEXT_PACK_CHARS + "\n... [context pack truncated]".chars().count(),
+            "truncation must keep output within cap"
+        );
+        assert!(rendered.ends_with("[context pack truncated]"));
+    }
+
+    #[test]
+    fn context_pack_is_recomputed_each_discover_call() {
+        // Invariant: no cross-turn cache — each discover_with_git rebuilds the
+        // pack from the current workspace. The test mutates git between two
+        // discover calls and expects the second call to observe the new state.
+        let _guard = env_lock();
+        ensure_valid_cwd();
+        let root = temp_dir();
+        fs::create_dir_all(&root).expect("root dir");
+        std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&root)
+            .status()
+            .expect("git init");
+        std::process::Command::new("git")
+            .args(["config", "user.email", "t@example.com"])
+            .current_dir(&root)
+            .status()
+            .expect("config email");
+        std::process::Command::new("git")
+            .args(["config", "user.name", "T"])
+            .current_dir(&root)
+            .status()
+            .expect("config name");
+        fs::write(root.join("initial.txt"), "seed").expect("seed");
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(&root)
+            .status()
+            .expect("add seed");
+        std::process::Command::new("git")
+            .args(["commit", "-m", "seed", "--quiet"])
+            .current_dir(&root)
+            .status()
+            .expect("commit seed");
+
+        // First discover: no changed files.
+        let first = ProjectContext::discover_with_git(&root, "2026-04-22").expect("first discover");
+        let first_count = first
+            .context_pack
+            .as_ref()
+            .map_or(0, |p| p.changed_files.len());
+
+        // Introduce a change between calls.
+        fs::write(root.join("a.txt"), "hello").expect("a.txt");
+        std::process::Command::new("git")
+            .args(["add", "a.txt"])
+            .current_dir(&root)
+            .status()
+            .expect("stage a.txt");
+
+        let second =
+            ProjectContext::discover_with_git(&root, "2026-04-22").expect("second discover");
+        let second_count = second
+            .context_pack
+            .as_ref()
+            .map_or(0, |p| p.changed_files.len());
+
+        assert!(
+            second_count > first_count,
+            "second discover must observe new changes (first={first_count}, second={second_count}) — no cross-turn caching",
         );
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
